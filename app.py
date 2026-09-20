@@ -519,6 +519,36 @@ def fast_agent(
     return adk["LlmAgent"](**kwargs)
 
 
+def deep_text_agent(
+    name: str,
+    instruction: str,
+    max_output_tokens: int = 120,
+):
+    """
+    GPT-OSS 120B agent WITHOUT structured-output validation.
+
+    Assessment intentionally uses compact plain text because the previous
+    JSON-schema validation was the failing point.
+    """
+    adk = get_adk()
+
+    return adk["LlmAgent"](
+        name=name,
+        model=adk["LiteLlm"](
+            model=DEEP_MODEL_NAME,
+            api_key=GROQ_API_KEY,
+            reasoning_effort="low",
+            include_reasoning=False,
+        ),
+        description=name,
+        instruction=instruction,
+        generate_content_config=adk["types"].GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=max_output_tokens,
+        ),
+    )
+
+
 def deep_agent(
     name: str,
     instruction: str,
@@ -620,6 +650,177 @@ async def run_adk_agent(
                     texts.append(part.text)
 
     return "\n".join(texts)
+
+
+
+# ============================================================
+# COMPACT ASSESSMENT TEXT PARSERS
+# ============================================================
+
+def _clean_field(value: str) -> str:
+    value = value.strip()
+    value = re.sub(
+        r"^\s*[-•*]+\s*",
+        "",
+        value,
+    )
+    return value[:240].strip()
+
+
+def _split_items(value: str, max_items: int = 2) -> list[str]:
+    if not value:
+        return []
+
+    parts = re.split(
+        r"\s*(?:\||;|\n)\s*",
+        value.strip(),
+    )
+
+    clean = []
+
+    for part in parts:
+        item = _clean_field(part)
+        if item and item.lower() not in {"none", "n/a", "-"}:
+            clean.append(item)
+
+        if len(clean) >= max_items:
+            break
+
+    return clean
+
+
+def parse_compact_assessment(
+    text: str,
+    default_skill: str,
+) -> dict:
+    """
+    Parse the deliberately tiny plain-text assessment format.
+
+    Expected examples:
+      SKILL: Control Systems
+      SCORE: 0.72
+      STRENGTHS: Correct PID structure | Clear explanation
+      WEAKNESSES: Missing saturation analysis
+      EVIDENCE: Correct transfer function
+      REASON: Main concept is understood.
+
+    This parser is intentionally tolerant of Markdown and small wording
+    variations so the assessment path does not depend on JSON-schema
+    generation.
+    """
+
+    if not text:
+        raise ValueError(
+            "The assessment model returned no text."
+        )
+
+    normalized = text.replace(
+        "\r",
+        "",
+    ).strip()
+
+    def capture(label: str) -> str:
+        pattern = (
+            rf"(?im)^\s*{re.escape(label)}\s*:\s*(.+?)\s*$"
+        )
+
+        match = re.search(
+            pattern,
+            normalized,
+        )
+
+        return (
+            match.group(1).strip()
+            if match
+            else ""
+        )
+
+    skill = capture("SKILL")
+    if not skill:
+        skill = default_skill
+
+    score_raw = capture("SCORE")
+
+    score_match = re.search(
+        r"(?:0(?:\.\d+)?|1(?:\.0+)?)",
+        score_raw,
+    )
+
+    if score_match:
+        score = float(
+            score_match.group(0)
+        )
+    else:
+        # Some models may output "72%".
+        percent_match = re.search(
+            r"(\d{1,3})\s*%",
+            score_raw,
+        )
+
+        if percent_match:
+            score = (
+                float(percent_match.group(1))
+                / 100.0
+            )
+        else:
+            score = 0.5
+
+    score = max(
+        0.0,
+        min(
+            1.0,
+            score,
+        ),
+    )
+
+    strengths = _split_items(
+        capture("STRENGTHS"),
+        max_items=2,
+    )
+
+    if not strengths:
+        strengths = _split_items(
+            capture("STRENGTH"),
+            max_items=2,
+        )
+
+    weaknesses = _split_items(
+        capture("WEAKNESSES"),
+        max_items=2,
+    )
+
+    if not weaknesses:
+        weaknesses = _split_items(
+            capture("WEAKNESS"),
+            max_items=2,
+        )
+
+    evidence = _split_items(
+        capture("EVIDENCE"),
+        max_items=2,
+    )
+
+    reason = (
+        capture("REASON")
+        or capture("FEEDBACK")
+        or "Assessment completed from the submitted evidence."
+    )
+
+    action = (
+        capture("ACTION")
+        or capture("RECOMMENDED_ACTION")
+        or "Address the main weakness and resubmit evidence."
+    )
+
+    return {
+        "skill": skill.strip()[:120],
+        "score": round(score, 3),
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "evidence": evidence,
+        "feedback": _clean_field(reason),
+        "recommended_action": _clean_field(action),
+    }
 
 
 # ============================================================
@@ -1037,174 +1238,297 @@ async def ui_assess_and_adapt(
     ui_state,
 ):
     try:
-        if not ui_state:
-            return "⚠️ Analyze your profile first.", "", "", ui_state
 
-        if not ui_state.get("current_task"):
-            return "⚠️ Generate a practice task first.", "", "", ui_state
+        if not ui_state:
+            return (
+                "⚠️ Analyze your profile first.",
+                "",
+                "",
+                ui_state,
+            )
+
+        if not ui_state.get(
+            "current_task"
+        ):
+            return (
+                "⚠️ Generate a practice task first.",
+                "",
+                "",
+                ui_state,
+            )
 
         if not learner_submission.strip():
-            return "⚠️ Submit some work first.", "", "", ui_state
+            return (
+                "⚠️ Submit some work first.",
+                "",
+                "",
+                ui_state,
+            )
 
         task = PracticeTask.model_validate(
-            ui_state["current_task"]
+            ui_state[
+                "current_task"
+            ]
         )
 
-        # ---------------------------
-        # GPT-OSS 120B — stage 1
-        # ---------------------------
-        notes_agent = deep_agent(
+        # ==================================================
+        # GPT-OSS 120B — STAGE 1
+        # NO JSON SCHEMA.
+        # This avoids the exact json_validate_failed error
+        # seen in the previous deployment.
+        # ==================================================
+
+        notes_agent = deep_text_agent(
             name="assessment_notes_agent",
             instruction="""
-Analyze the practice task and learner submission.
+You are a technical assessment analyst.
 
-Return compact notes only.
+Analyze the learner submission against the assigned task.
 
-Limits:
-- max 2 strengths
-- max 2 weaknesses
-- max 2 evidence items
-- key_reason = one short sentence
-- score_estimate = 0.0 to 1.0
-- no long explanation
-- use only submitted evidence
+Return EXACTLY these six lines and nothing else:
+
+SKILL: <skill>
+SCORE: <0.0 to 1.0>
+STRENGTHS: <item> | <item>
+WEAKNESSES: <item> | <item>
+EVIDENCE: <item> | <item>
+REASON: <one short sentence>
+
+Rules:
+- maximum 2 items after each list label
+- keep each item short
+- score must be numeric
+- use only evidence in the submission
+- do not invent missing work
+- no markdown
+- no JSON
 """,
-            output_schema=AssessmentNotes,
-            output_key="assessment_notes",
-            max_output_tokens=180,
+            max_output_tokens=120,
         )
 
-        prompt_a = f"""
-TASK: {json.dumps(task.model_dump(), separators=(',', ':'))}
-SUBMISSION: {learner_submission[:7000]}
+        task_compact = {
+            "skill": task.skill,
+            "title": task.title,
+            "objective": task.objective,
+            "success_criteria": task.success_criteria,
+        }
 
-Return compact notes only.
+        prompt_a = f"""
+TASK:
+{json.dumps(
+    task_compact,
+    separators=(",", ":"),
+)}
+
+SUBMISSION:
+{learner_submission[:6000]}
+
+Return exactly the six requested lines.
 """
 
-        notes_raw = await run_adk_agent(
+        notes_text = await run_adk_agent(
             notes_agent,
             prompt_a,
-            output_key="assessment_notes",
+            output_key=None,
             user_prefix="deep_notes",
-            estimated_output_tokens=180,
+            estimated_output_tokens=120,
             budget="deep",
         )
 
-        notes = AssessmentNotes.model_validate(
-            notes_raw
+        notes = parse_compact_assessment(
+            notes_text,
+            default_skill=task.skill,
         )
 
-        # ---------------------------
-        # GPT-OSS 120B — stage 2
-        # ---------------------------
-        final_agent = deep_agent(
+        # ==================================================
+        # GPT-OSS 120B — STAGE 2
+        # Only compact notes are sent.
+        # Still plain text, so there is NO JSON-schema failure.
+        # ==================================================
+
+        final_agent = deep_text_agent(
             name="assessment_final_agent",
             instruction="""
-Convert ONLY the compact assessment notes into the final assessment.
+Review the compact assessment notes.
 
-Do not analyze the original submission.
-Do not add evidence.
+Return EXACTLY these five lines and nothing else:
 
-Limits:
-- max 2 strengths
-- max 2 weaknesses
-- max 2 evidence items
-- feedback = one short paragraph
-- recommended action = one short sentence
-- return only structured output
+SCORE: <0.0 to 1.0>
+STRENGTHS: <item> | <item>
+WEAKNESSES: <item> | <item>
+FEEDBACK: <one short sentence>
+ACTION: <one short sentence>
+
+Rules:
+- preserve the evidence-based score
+- maximum 2 items per list
+- do not introduce new evidence
+- no JSON
+- no markdown
 """,
-            output_schema=AssessmentResult,
-            output_key="assessment_result",
-            max_output_tokens=260,
+            max_output_tokens=110,
         )
 
         prompt_b = f"""
 COMPACT NOTES:
-{json.dumps(notes.model_dump(), separators=(',', ':'))}
+{json.dumps(
+    notes,
+    separators=(",", ":"),
+)}
 
-Return the final assessment only.
+Return exactly the five requested lines.
 """
 
         try:
-            final_raw = await run_adk_agent(
+
+            final_text = await run_adk_agent(
                 final_agent,
                 prompt_b,
-                output_key="assessment_result",
+                output_key=None,
                 user_prefix="deep_final",
-                estimated_output_tokens=260,
+                estimated_output_tokens=110,
                 budget="deep",
             )
-        except Exception as exc:
-            if not is_rate_limit_error(exc):
-                raise
 
-            # No third LLM call.
-            final_raw = {
-                "skill": notes.skill,
-                "score": notes.score_estimate,
-                "strengths": notes.strengths,
-                "weaknesses": notes.weaknesses,
-                "evidence": notes.evidence,
-                "feedback": notes.key_reason,
-                "recommended_action": (
-                    "Address the main weakness and resubmit evidence."
-                ),
-            }
+            refined = parse_compact_assessment(
+                final_text,
+                default_skill=notes["skill"],
+            )
+
+            # Stage 2 may omit evidence by design. Preserve the
+            # evidence captured by Stage 1.
+            refined["evidence"] = (
+                notes["evidence"]
+            )
+
+            # Guard against an accidental score jump caused by
+            # an unconstrained second-pass rewrite.
+            if abs(
+                refined["score"]
+                - notes["score"]
+            ) > 0.25:
+
+                refined["score"] = (
+                    notes["score"]
+                )
+
+            if not refined["strengths"]:
+                refined["strengths"] = (
+                    notes["strengths"]
+                )
+
+            if not refined["weaknesses"]:
+                refined["weaknesses"] = (
+                    notes["weaknesses"]
+                )
+
+            if not refined["feedback"]:
+                refined["feedback"] = (
+                    notes["feedback"]
+                )
+
+            assessment_data = refined
+
+        except Exception as second_stage_error:
+
+            # Stage 1 is already a complete assessment.
+            # Do NOT make a third LLM call.
+            assessment_data = notes
 
         assessment = AssessmentResult.model_validate(
-            final_raw
+            assessment_data
         )
 
         skill_name = normalize_skill_name(
             assessment.skill
         )
 
-        if skill_name not in ui_state["skills"]:
-            ui_state["skills"][skill_name] = {
+        if skill_name not in ui_state[
+            "skills"
+        ]:
+
+            ui_state[
+                "skills"
+            ][skill_name] = {
                 "mastery": 0.0,
                 "confidence": 0.3,
                 "evidence": [],
                 "assessment_scores": [],
             }
 
-        record = ui_state["skills"][skill_name]
-        before = float(record["mastery"])
-        alpha = 0.30
-        after = (
-            (1 - alpha) * before
-            + alpha * assessment.score
+        record = ui_state[
+            "skills"
+        ][skill_name]
+
+        before = float(
+            record["mastery"]
         )
 
-        record["mastery"] = round(
-            max(0.0, min(1.0, after)),
+        alpha = 0.30
+
+        after = (
+            (1 - alpha)
+            * before
+            + alpha
+            * assessment.score
+        )
+
+        record[
+            "mastery"
+        ] = round(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    after,
+                ),
+            ),
             3,
         )
 
-        record["assessment_scores"].append(
+        record[
+            "assessment_scores"
+        ].append(
             assessment.score
         )
-        record["evidence"].extend(
+
+        record[
+            "evidence"
+        ].extend(
             assessment.evidence
         )
 
-        ui_state["latest_assessment"] = (
-            assessment.model_dump()
+        ui_state[
+            "latest_assessment"
+        ] = assessment.model_dump()
+
+        ui_state[
+            "completed_tasks"
+        ].append(
+            {
+                "title": task.title,
+                "skill": task.skill,
+                "score": assessment.score,
+            }
         )
 
-        ui_state["completed_tasks"].append({
-            "title": task.title,
-            "skill": task.skill,
-            "score": assessment.score,
-        })
-
-        ui_state["gaps"] = calculate_skill_gaps(
+        ui_state[
+            "gaps"
+        ] = calculate_skill_gaps(
             LearnerProfile.model_validate(
-                ui_state["profile"] | {
+                ui_state[
+                    "profile"
+                ]
+                | {
                     "skills": [
                         {
                             "name": name,
-                            "proficiency": value["mastery"],
-                            "confidence": value["confidence"],
+                            "proficiency": value[
+                                "mastery"
+                            ],
+                            "confidence": value[
+                                "confidence"
+                            ],
                             "evidence": (
                                 value["evidence"][0]
                                 if value["evidence"]
@@ -1212,14 +1536,20 @@ Return the final assessment only.
                             ),
                         }
                         for name, value
-                        in ui_state["skills"].items()
+                        in ui_state[
+                            "skills"
+                        ].items()
                     ],
                 }
             ),
-            ui_state["target_role"],
+            ui_state[
+                "target_role"
+            ],
         )
 
-        ui_state["plan_version"] += 1
+        ui_state[
+            "plan_version"
+        ] += 1
 
         adaptation = f"""
 ## 🔄 Learning Path Updated
@@ -1227,23 +1557,28 @@ Return the final assessment only.
 **{skill_name}**
 
 Before: **{before:.0%}**  
-After: **{record['mastery']:.0%}**
+After: **{record["mastery"]:.0%}**
 
 **Current priority:**  
-{ui_state['gaps'][0]['skill'] if ui_state['gaps'] else 'None'}
+{ui_state["gaps"][0]["skill"] if ui_state["gaps"] else "None"}
 
 The assessment evidence was incorporated and the remaining gaps were recalculated.
 """
 
         return (
-            format_assessment(assessment),
+            format_assessment(
+                assessment
+            ),
             adaptation,
             "## 🎯 Updated Skill Gaps\n\n"
-            + format_gaps(ui_state["gaps"]),
+            + format_gaps(
+                ui_state["gaps"]
+            ),
             ui_state,
         )
 
     except Exception as exc:
+
         return (
             f"❌ **Assessment failed**\n\n"
             f"`{type(exc).__name__}: {exc}`",
@@ -1251,6 +1586,8 @@ The assessment evidence was incorporated and the remaining gaps were recalculate
             "",
             ui_state,
         )
+
+
 
 
 async def ui_replan(ui_state):

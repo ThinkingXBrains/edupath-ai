@@ -1,29 +1,26 @@
-# EduPath architecture
+# EduPath Architecture
 
-```text
 Learner
   ↓
 Profile Insights — Qwen 3.8 27B
   ↓
-Python canonicalization
+Python canonicalization + gap calculation
   ↓
-Deterministic skill gaps
+Learning Plan — Qwen 3.8 27B
   ↓
-Plan — Qwen 3.8 27B
+Practice Task — Qwen 3.8 27B
   ↓
-Practice — Qwen 3.8 27B
+Learner Submission
   ↓
-Learner submission
+Deep Assessment Stage 1 — GPT-OSS 120B
   ↓
-Deep notes — GPT-OSS 120B
+Compact text notes
   ↓
-Compact notes
+Deep Assessment Stage 2 — GPT-OSS 120B
   ↓
-Final assessment — GPT-OSS 120B
+Python parses final assessment
   ↓
-Deterministic mastery update
-  ↓
-Gap recalculation
+Python mastery + gap update
   ↓
 Replan — Qwen 3.8 27B
   ↓
@@ -32,7 +29,3 @@ Research — DDGS
 Progress — Python
   ↓
 Ask EduPath — Qwen 3.8 27B
-```
-
-The ADK/LiteLLM/model layer is imported lazily so Render can bind its web port
-before any model objects are constructed.

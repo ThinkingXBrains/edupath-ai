@@ -1,17 +1,13 @@
-Render
-------
-Build: pip install -r requirements.txt
-Start: python app.py
-Secret: GROQ_API_KEY
+Render:
+Build = pip install -r requirements.txt
+Start = python app.py
+Secret = GROQ_API_KEY
 
-Demo
-----
-1. Analyze Profile
-2. Generate Plan
-3. Generate Practice
-4. Submit Work
-5. Assess & Adapt
-6. Generate Updated Plan
-7. Research
-8. Progress
-9. Ask EduPath
+Demo order:
+Analyze Profile → Generate Plan → Generate Practice →
+Submit Work → Assess & Adapt → Generate Updated Plan →
+Research → Progress → Ask EduPath
+
+Assessment:
+GPT-OSS 120B is used twice with compact plain-text formats.
+No JSON-schema validation is used for the 120B assessment path.

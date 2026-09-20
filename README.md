@@ -7,48 +7,28 @@ sdk: gradio
 app_file: app.py
 ---
 
-# EduPath — Adaptive Learning Companion
+# 🎓 EduPath — Adaptive Learning Companion
 
-Two-model learning agent built with Google ADK + Groq.
+Two-model adaptive learning prototype.
 
-## Model routing
+### Qwen 3.8 27B
+Profile insights, planning, practice and Q&A.
 
-**Qwen 3.8 27B**
-- learner profile insights
-- learning plan
-- practice task
-- learner Q&A
+### GPT-OSS 120B
+Two-stage deep practice assessment using compact plain-text outputs instead
+of JSON-schema generation.
 
-**GPT-OSS 120B**
-- deep practice assessment
-- Stage 1: compact evidence analysis
-- Stage 2: compact final structured result
-
-**Python**
-- canonical skill mapping
-- gap calculation
-- mastery update
-- progress report
-
-**DDGS**
-- web research without an additional LLM call
-
-## Important design choice
-
-The profile model does not regenerate UI-owned fields such as target role,
-experience years or weekly hours. This prevents unnecessary output tokens and
-schema truncation.
+### Python
+Canonical skill mapping, deterministic gaps, mastery updates and final
+assessment object construction.
 
 ## Render
 
-Build command:
-
+Build:
 `pip install -r requirements.txt`
 
-Start command:
-
+Start:
 `python app.py`
 
 Required secret:
-
 `GROQ_API_KEY`

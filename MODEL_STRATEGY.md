@@ -1,15 +1,39 @@
-# Final model strategy
+# EduPath — Final Assessment Architecture
 
-The application deliberately separates inference from deterministic state.
+## Root cause of the previous failure
 
-Qwen 3.8 27B is the high-frequency workhorse. GPT-OSS 120B is reserved for the
-highest-value deep assessment and is used in two compact stages. The second
-stage receives only the compact first-stage notes, not the full learner
-submission.
+The 120B assessment agent was asked to return a Pydantic/JSON-schema document
+with a tight completion cap. Groq rejected the generation when the response
+did not satisfy the structured schema.
 
-The profile schema is intentionally small. Role, experience and weekly hours
-come from the UI; the model only returns goals and evidence-backed skills.
+## Final fix
 
-The application uses a client-side rolling output reservation to avoid bursts
-against the current account's output-token allowance. This does not circumvent
-provider limits.
+Assessment deliberately does NOT use structured JSON output.
+
+GPT-OSS 120B is still used twice:
+
+1. **Stage 1 — deep compact analysis**
+   - task + submission
+   - six short text lines
+   - max 120 completion tokens
+
+2. **Stage 2 — compact review**
+   - Stage 1 notes only
+   - five short text lines
+   - max 110 completion tokens
+
+Python parses these lines into `AssessmentResult`.
+
+If Stage 2 fails, Stage 1 is already a complete assessment and is used directly.
+No third LLM call is made.
+
+## Deterministic responsibilities
+
+Python owns:
+- skill normalization
+- mastery calculation
+- gap recalculation
+- final assessment schema construction
+- fallback behavior
+
+This removes JSON-schema validation from the fragile deep-assessment path.

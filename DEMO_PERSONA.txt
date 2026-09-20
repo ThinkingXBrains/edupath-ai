@@ -4,7 +4,7 @@ Learning time: 8 hours/week
 
 Background:
 I am a power electronics engineer with 4 years of automotive and EV experience.
-I work with PMSM, FOC, SVPWM, MATLAB and Simulink. I have practical motor-control
-and regenerative-braking experience. I have some Python experience and basic
-machine-learning knowledge. I am learning LLMs, Agentic AI and MCP and want to
-combine them with EV controls.
+I work with PMSM, FOC, SVPWM, MATLAB and Simulink. I have practical
+motor-control and regenerative-braking experience. I have some Python
+experience and basic machine-learning knowledge. I am learning LLMs,
+Agentic AI and MCP and want to combine them with EV controls.
