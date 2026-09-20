@@ -1,28 +1,17 @@
-Hackathon submission
+GitHub / Render submission notes
 
-Agent Access Link:
-Use the public Render URL:
-https://<your-service>.onrender.com
+Render:
+Build = pip install -r requirements.txt
+Start = python app.py
 
-Agent Credentials:
-Not required — public demo.
+Secret:
+GROQ_API_KEY
 
-Additional Materials:
-- GitHub repository
-- ARCHITECTURE.md
-- MODEL_STRATEGY.md
-- optional demo video
+Demo:
+Analyze → Plan → Practice → Submit → Assess & Adapt → Replan → Research → Progress → Ask
 
-Recommended demo:
-1. Analyze Profile
-2. Generate Learning Plan
-3. Generate Practice
-4. Submit Work
-5. Assess & Adapt
-6. Generate Updated Plan
-7. Research Current Gap
-8. Generate Progress Report
-9. Ask EduPath
+Two-model routing:
+Qwen 3.8 27B = frequent learner operations
+GPT-OSS 120B = deep assessment only
 
-Security:
-Keep GROQ_API_KEY only in Render environment variables.
+Do not publish the Groq API key.

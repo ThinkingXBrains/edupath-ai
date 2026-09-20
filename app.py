@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +24,27 @@ from google.genai import types
 APP_NAME = "edupath"
 
 # Hybrid two-LLM strategy
+# Qwen handles frequent, compact operations.
 FAST_MODEL_NAME = os.getenv(
     "FAST_MODEL_NAME",
     "groq/qwen/qwen3.8-27b",
 )
+
+# GPT-OSS 120B is reserved for the deepest assessment step.
 DEEP_MODEL_NAME = os.getenv(
     "DEEP_MODEL_NAME",
     "groq/openai/gpt-oss-120b",
 )
+
+# Your screenshot showed a 1K output-token/minute ceiling on Qwen.
+# Keep a conservative local reservation below that ceiling.
+FAST_OUTPUT_BUDGET_PER_MINUTE = 850
+DEEP_OUTPUT_BUDGET_PER_MINUTE = 7000
+
+_fast_budget = []
+_deep_budget = []
+_fast_budget_lock = asyncio.Lock()
+_deep_budget_lock = asyncio.Lock()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -46,7 +60,6 @@ groq_client = Groq(
 
 
 def fast_model():
-    # Qwen 3.8 27B supports strict structured outputs and tunable reasoning.
     return LiteLlm(
         model=FAST_MODEL_NAME,
         api_key=GROQ_API_KEY,
@@ -56,7 +69,6 @@ def fast_model():
 
 
 def deep_model():
-    # GPT-OSS 120B is reserved for the hardest assessment stage.
     return LiteLlm(
         model=DEEP_MODEL_NAME,
         api_key=GROQ_API_KEY,
@@ -184,22 +196,22 @@ class Skill(BaseModel):
     name: str
     proficiency: float = Field(ge=0.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence: list[str]
+    evidence: str
 
 
 class LearnerProfile(BaseModel):
     target_role: str
     experience_years: float
-    goals: list[str]
+    goals: list[str] = Field(max_length=3)
     weekly_hours: float
-    skills: list[Skill]
+    skills: list[Skill] = Field(max_length=8)
 
 
 class LearningWeek(BaseModel):
     week: int
     objective: str
-    topics: list[str]
-    practice_tasks: list[str]
+    topics: list[str] = Field(max_length=3)
+    practice_tasks: list[str] = Field(max_length=1)
     deliverable: str
     assessment: str
     estimated_hours: float
@@ -209,7 +221,7 @@ class LearningPlan(BaseModel):
     target_role: str
     total_weeks: int
     weekly_hours: float
-    weeks: list[LearningWeek]
+    weeks: list[LearningWeek] = Field(max_length=4)
 
 
 class PracticeTask(BaseModel):
@@ -217,18 +229,27 @@ class PracticeTask(BaseModel):
     title: str
     difficulty: str
     objective: str
-    instructions: list[str]
+    instructions: list[str] = Field(max_length=5)
     deliverable: str
     estimated_hours: float
-    success_criteria: list[str]
+    success_criteria: list[str] = Field(max_length=4)
+
+
+class AssessmentNotes(BaseModel):
+    skill: str
+    score_estimate: float = Field(ge=0.0, le=1.0)
+    strengths: list[str] = Field(max_length=2)
+    weaknesses: list[str] = Field(max_length=2)
+    evidence: list[str] = Field(max_length=2)
+    key_reason: str
 
 
 class AssessmentResult(BaseModel):
     skill: str
     score: float = Field(ge=0.0, le=1.0)
-    strengths: list[str]
-    weaknesses: list[str]
-    evidence: list[str]
+    strengths: list[str] = Field(max_length=2)
+    weaknesses: list[str] = Field(max_length=2)
+    evidence: list[str] = Field(max_length=2)
     feedback: str
     recommended_action: str
 
@@ -245,23 +266,23 @@ class LearningResource(BaseModel):
 
 class ResourceCollection(BaseModel):
     skill: str
-    resources: list[LearningResource]
+    resources: list[LearningResource] = Field(max_length=4)
 
 
 class SkillProgress(BaseModel):
     skill: str
     mastery: float
     status: str
-    evidence: list[str]
+    evidence: list[str] = Field(max_length=2)
 
 
 class ProgressReport(BaseModel):
     learner_role: str
     plan_version: int
-    skills_acquired: list[SkillProgress]
-    skills_in_progress: list[SkillProgress]
-    remaining_gaps: list[str]
-    recommended_next_steps: list[str]
+    skills_acquired: list[SkillProgress] = Field(max_length=8)
+    skills_in_progress: list[SkillProgress] = Field(max_length=8)
+    remaining_gaps: list[str] = Field(max_length=8)
+    recommended_next_steps: list[str] = Field(max_length=3)
     summary: str
 
 
@@ -269,214 +290,281 @@ class ProgressReport(BaseModel):
 # AGENTS — HYBRID ROUTING
 # ============================================================
 
-# FAST / EFFICIENT MODEL:
-# Qwen 3.8 27B is used for most structured and conversational work.
+# ============================================================
+# AGENTS — HYBRID + TOKEN-BUDGETED
+# ============================================================
+
 profile_agent = LlmAgent(
     name="profile_agent",
     model=fast_model(),
-    description="Creates an evidence-grounded learner profile.",
+    description="Builds a compact evidence-grounded learner profile.",
     instruction="""
-You are EduPath's Profile Analyst.
+Create a compact learner profile.
 
-Create a structured learner profile from the supplied information.
+ONLY use evidence in the learner input.
 
-Use only evidence present in the input.
-Do not invent skills, experience, certifications, or achievements.
-Separate proficiency from confidence.
-Use concrete evidence for every skill.
-Be conservative when evidence is weak.
+Hard limits:
+- maximum 8 skills
+- maximum 3 goals
+- evidence = ONE short sentence per skill
+- no explanations
+- no long prose
+- do not invent skills or credentials
 
 Return only the structured output.
 """,
     output_schema=LearnerProfile,
     output_key="learner_profile",
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=250,
+    ),
 )
 
 
 planner_agent = LlmAgent(
     name="planner_agent",
     model=fast_model(),
-    description="Builds a personalized four-week learning plan.",
+    description="Creates a compact four-week personalized learning plan.",
     instruction="""
-You are EduPath's Learning Planner.
+Create a compact four-week learning plan.
 
-Create a realistic 4-week learning plan based on the learner's:
-- target role
-- current skills
-- proficiency
-- confidence
-- remaining gaps
-- weekly learning time
-
-Prioritize meaningful gaps.
-Leverage existing domain strengths.
-Avoid spending large amounts of time reteaching demonstrated skills.
-Make each week practical and measurable.
+Hard limits:
+- exactly 4 weeks
+- maximum 3 topics per week
+- exactly 1 practice item per week
+- objective = one short sentence
+- deliverable = one short phrase/sentence
+- assessment = one short sentence
+- no long explanations
+- prioritize the biggest gaps
+- leverage existing strengths
 
 Return only the structured output.
 """,
     output_schema=LearningPlan,
     output_key="learning_plan",
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=300,
+    ),
 )
 
 
 practice_agent = LlmAgent(
     name="practice_agent",
     model=fast_model(),
-    description="Creates a practical hands-on task for the learner's current gap.",
+    description="Creates one compact practical task.",
     instruction="""
-You are EduPath's Practice Task Generator.
+Create ONE hands-on practice task for the highest-priority gap.
 
-Create one practical, project-oriented task for the learner's priority gap.
-
-Match difficulty to the learner's current level.
-Leverage their existing domain knowledge when useful.
-Keep it achievable within the available weekly time.
-Provide a concrete deliverable and measurable success criteria.
+Hard limits:
+- maximum 5 instructions
+- maximum 4 success criteria
+- each item = one short sentence
+- deliverable = one short sentence
+- no long explanation
 
 Return only the structured output.
 """,
     output_schema=PracticeTask,
     output_key="practice_task",
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=220,
+    ),
 )
 
 
-# DEEP MODEL:
-# GPT-OSS 120B is reserved for the highest-value reasoning step.
-assessment_agent_deep = LlmAgent(
-    name="assessment_agent_deep",
+# GPT-OSS 120B — Stage 1
+assessment_notes_agent = LlmAgent(
+    name="assessment_notes_agent",
     model=deep_model(),
-    description="Performs evidence-grounded deep assessment of learner work.",
+    description="Deep assessment stage 1: compact evidence analysis.",
     instruction="""
-You are EduPath's Deep Assessment Agent.
+Analyze the learner submission against the practice task.
 
-Evaluate the learner's submission against the assigned practice task.
+Return COMPACT NOTES.
 
-Assess:
-- conceptual correctness
-- technical correctness
-- completeness
-- practical execution
-- task success criteria
+Hard limits:
+- maximum 2 strengths
+- maximum 2 weaknesses
+- maximum 2 evidence items
+- key_reason = one short sentence
+- no long explanation
+- do not invent evidence
+""",
+    output_schema=AssessmentNotes,
+    output_key="assessment_notes",
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.0,
+        max_output_tokens=180,
+    ),
+)
 
-Use only evidence supplied in the submission.
-Do not assume missing work was completed.
-Give a score from 0.0 to 1.0.
-Be precise and constructive.
+
+# GPT-OSS 120B — Stage 2
+assessment_final_agent = LlmAgent(
+    name="assessment_final_agent",
+    model=deep_model(),
+    description="Deep assessment stage 2: final structured assessment.",
+    instruction="""
+Convert the compact assessment notes into the final result.
+
+Hard limits:
+- preserve the supplied evidence
+- maximum 2 strengths
+- maximum 2 weaknesses
+- maximum 2 evidence items
+- feedback = one short paragraph
+- recommended action = one short sentence
+- do not add new evidence
+- do not invent anything
 
 Return only the structured output.
 """,
     output_schema=AssessmentResult,
     output_key="assessment_result",
-)
-
-
-# FAST FALLBACK:
-# If the deep model is rate-limited, Qwen can still complete the assessment.
-assessment_agent_fast = LlmAgent(
-    name="assessment_agent_fast",
-    model=fast_model(),
-    description="Fallback assessment agent.",
-    instruction="""
-You are EduPath's Assessment Agent.
-
-Evaluate the learner's submission against the assigned practice task.
-Use only submitted evidence.
-Do not invent completed work.
-Return a score from 0.0 to 1.0 and specific strengths, weaknesses,
-evidence, feedback and the next action.
-
-Return only the structured output.
-""",
-    output_schema=AssessmentResult,
-    output_key="assessment_result",
-)
-
-
-resource_curator_agent = LlmAgent(
-    name="resource_curator_agent",
-    model=fast_model(),
-    description="Converts web-search evidence into curated learning resources.",
-    instruction="""
-You are EduPath's Resource Curator.
-
-You receive web-search results and verified URLs.
-
-Select 3-4 resources that best match the learner's skill gap and level.
-
-Rules:
-1. Use only URLs present in the supplied search results.
-2. Do not invent or alter URLs.
-3. Remove duplicates.
-4. Prefer official documentation, universities and established learning platforms.
-5. Return only the structured ResourceCollection.
-""",
-    output_schema=ResourceCollection,
-    output_key="resource_collection",
-)
-
-
-progress_agent = LlmAgent(
-    name="progress_agent",
-    model=fast_model(),
-    description="Generates a concise progress report from learner state.",
-    instruction="""
-You are EduPath's Progress Analyst.
-
-Use the supplied learner state, assessments and gaps.
-
-Classify:
-- Acquired: strong demonstrated mastery
-- In Progress: evidence exists but target is not reached
-
-Also report remaining gaps and specific next steps.
-
-Do not invent achievements.
-Return only the structured output.
-""",
-    output_schema=ProgressReport,
-    output_key="progress_report",
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.0,
+        max_output_tokens=180,
+    ),
 )
 
 
 qa_agent = LlmAgent(
     name="qa_agent",
     model=fast_model(),
-    description="Answers learner questions using current EduPath state.",
+    description="Answers learner questions from compact state.",
     instruction="""
-You are EduPath's Learning Companion.
+Answer the learner's question from the supplied state.
 
-Answer the learner using the supplied learner state.
-Be practical and concise.
-Do not invent scores, achievements, skills or resources.
+Hard limit:
+- maximum 120 words
+- no invented achievements, scores or skills
+- be direct and useful
 """,
+    generate_content_config=types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=160,
+    ),
 )
 
 
 # ============================================================
-# ADK RUNNER
+# ADK RUNNER + TOKEN BUDGET
 # ============================================================
 
 def is_rate_limit_error(exc: Exception) -> bool:
     text = str(exc).lower()
+
     return (
         "rate limit" in text
         or "rate_limit" in text
         or "tokens per minute" in text
+        or "output tokens per minute" in text
         or "429" in text
     )
 
 
-async def run_adk_agent(
-    agent,
-    message_text: str,
-    output_key: str | None = None,
-    user_prefix: str = "edupath",
+async def reserve_output_budget(
+    bucket,
+    lock,
+    limit,
+    estimated_tokens,
 ):
     """
-    Run an ADK agent in a short-lived in-memory session.
+    Conservative client-side rolling output-token reservation.
+    It prevents a burst of requests from exceeding a 1K-ish
+    free-tier output budget.
     """
-    user_id = f"{user_prefix}_{uuid.uuid4().hex[:8]}"
+
+    estimated_tokens = int(
+        estimated_tokens
+    )
+
+    while True:
+
+        async with lock:
+
+            now = time.monotonic()
+
+            cutoff = now - 60.0
+
+            bucket[:] = [
+                (ts, tokens)
+                for ts, tokens
+                in bucket
+                if ts >= cutoff
+            ]
+
+            used = sum(
+                tokens
+                for _, tokens
+                in bucket
+            )
+
+            if (
+                used
+                + estimated_tokens
+                <= limit
+            ):
+
+                bucket.append(
+                    (
+                        now,
+                        estimated_tokens,
+                    )
+                )
+
+                return
+
+            wait_for = (
+                bucket[0][0]
+                + 60.0
+                - now
+                + 0.25
+            )
+
+        await asyncio.sleep(
+            max(wait_for, 0.25)
+        )
+
+
+async def run_adk_agent(
+    agent,
+    message_text,
+    output_key=None,
+    user_prefix="edupath",
+    estimated_output_tokens=200,
+    budget="fast",
+):
+    """
+    Run an ADK agent after reserving an output-token budget.
+    """
+
+    if budget == "deep":
+
+        await reserve_output_budget(
+            _deep_budget,
+            _deep_budget_lock,
+            DEEP_OUTPUT_BUDGET_PER_MINUTE,
+            estimated_output_tokens,
+        )
+
+    else:
+
+        await reserve_output_budget(
+            _fast_budget,
+            _fast_budget_lock,
+            FAST_OUTPUT_BUDGET_PER_MINUTE,
+            estimated_output_tokens,
+        )
+
+    user_id = (
+        f"{user_prefix}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
 
     runner = InMemoryRunner(
         agent=agent,
@@ -504,58 +592,52 @@ async def run_adk_agent(
         session_id=session.id,
         new_message=message,
     ):
+
         events.append(event)
 
     if output_key:
+
         state = await runner.session_service.get_session(
             app_name=APP_NAME,
             user_id=user_id,
             session_id=session.id,
         )
 
-        result = state.state.get(output_key)
+        result = state.state.get(
+            output_key
+        )
 
-        if isinstance(result, str):
-            result = json.loads(result)
+        if isinstance(
+            result,
+            str,
+        ):
+
+            result = json.loads(
+                result
+            )
 
         return result
 
     text_parts = []
 
     for event in events:
-        if event.is_final_response() and event.content:
+
+        if (
+            event.is_final_response()
+            and event.content
+        ):
+
             for part in event.content.parts:
+
                 if part.text:
-                    text_parts.append(part.text)
 
-    return "\n".join(text_parts)
+                    text_parts.append(
+                        part.text
+                    )
 
-
-async def run_with_fallback(
-    primary_agent,
-    fallback_agent,
-    message_text,
-    output_key,
-    user_prefix,
-):
-    try:
-        return await run_adk_agent(
-            primary_agent,
-            message_text,
-            output_key=output_key,
-            user_prefix=user_prefix,
-        )
-    except Exception as primary_error:
-        # Fallback is intentionally used for quota/rate-limit errors.
-        if not is_rate_limit_error(primary_error):
-            raise
-
-        return await run_adk_agent(
-            fallback_agent,
-            message_text,
-            output_key=output_key,
-            user_prefix=f"{user_prefix}_fallback",
-        )
+    return "\n".join(
+        text_parts
+    )
 
 
 # ============================================================
@@ -713,25 +795,39 @@ def format_assessment(result: AssessmentResult) -> str:
 """
 
 
-def format_resources(collection: ResourceCollection) -> str:
+def format_resources(results, skill):
     text = f"""
 ## 🔎 Recommended Resources
 
-**Current focus:** {collection.skill}
+**Current focus:** {skill}
 """
 
-    for i, resource in enumerate(
-        collection.resources,
+    for i, item in enumerate(
+        results,
         1,
     ):
+
+        url = item.get(
+            "url",
+            "",
+        )
+
+        title = item.get(
+            "title",
+            "Untitled",
+        )
+
+        snippet = item.get(
+            "snippet",
+            "",
+        )
+
         text += f"""
-### {i}. {resource.title}
+### {i}. {title}
 
-**{resource.provider}** · {resource.difficulty} · {resource.estimated_hours:.1f} hrs · {resource.cost}
+{snippet}
 
-{resource.relevance}
-
-🔗 {resource.url}
+🔗 {url}
 
 """
 
@@ -873,6 +969,8 @@ Resume / portfolio:
             prompt,
             output_key="learner_profile",
             user_prefix="profile",
+            estimated_output_tokens=250,
+            budget="fast",
         )
 
         profile = LearnerProfile.model_validate(
@@ -963,6 +1061,8 @@ Create a realistic four-week plan.
             prompt,
             output_key="learning_plan",
             user_prefix="planner",
+            estimated_output_tokens=300,
+            budget="fast",
         )
 
         plan = LearningPlan.model_validate(
@@ -1016,6 +1116,8 @@ Create one practical hands-on task.
             prompt,
             output_key="practice_task",
             user_prefix="practice",
+            estimated_output_tokens=220,
+            budget="fast",
         )
 
         task = PracticeTask.model_validate(
@@ -1041,10 +1143,20 @@ async def ui_assess_and_adapt(
     ui_state,
 ):
     try:
-        if not ui_state:
-            return "⚠️ Analyze your profile first.", "", "", ui_state
 
-        if not ui_state.get("current_task"):
+        if not ui_state:
+
+            return (
+                "⚠️ Analyze your profile first.",
+                "",
+                "",
+                ui_state,
+            )
+
+        if not ui_state.get(
+            "current_task"
+        ):
+
             return (
                 "⚠️ Generate a practice task first.",
                 "",
@@ -1053,6 +1165,7 @@ async def ui_assess_and_adapt(
             )
 
         if not learner_submission.strip():
+
             return (
                 "⚠️ Submit some work first.",
                 "",
@@ -1061,152 +1174,261 @@ async def ui_assess_and_adapt(
             )
 
         task = PracticeTask.model_validate(
-            ui_state["current_task"]
+            ui_state[
+                "current_task"
+            ]
         )
 
-        prompt = f"""
-PRACTICE TASK:
-{json.dumps(task.model_dump(), indent=2)}
+        # ==================================================
+        # GPT-OSS 120B STAGE 1
+        # Compact evidence analysis
+        # ==================================================
 
-LEARNER SUBMISSION:
-{learner_submission}
+        prompt_a = f"""
+TASK:
+{json.dumps(task.model_dump(), separators=(",", ":"))}
+
+SUBMISSION:
+{learner_submission[:7000]}
+
+Analyze compactly.
 """
 
-        raw_result = await run_with_fallback(
-            assessment_agent_deep,
-            assessment_agent_fast,
-            prompt,
-            output_key="assessment_result",
-            user_prefix="assessment",
+        raw_notes = await run_adk_agent(
+            assessment_notes_agent,
+            prompt_a,
+            output_key="assessment_notes",
+            user_prefix="deep_notes",
+            estimated_output_tokens=180,
+            budget="deep",
         )
 
+        notes = AssessmentNotes.model_validate(
+            raw_notes
+        )
+
+        # ==================================================
+        # GPT-OSS 120B STAGE 2
+        # Final structured assessment
+        # ==================================================
+
+        prompt_b = f"""
+COMPACT ASSESSMENT NOTES:
+{json.dumps(notes.model_dump(), separators=(",", ":"))}
+
+Return the final assessment only.
+"""
+
+        try:
+
+            raw_final = await run_adk_agent(
+                assessment_final_agent,
+                prompt_b,
+                output_key="assessment_result",
+                user_prefix="deep_final",
+                estimated_output_tokens=180,
+                budget="deep",
+            )
+
+        except Exception as deep_exc:
+
+            # If stage 2 is rate-limited, the compact notes
+            # are already enough to provide a valid fallback.
+            if is_rate_limit_error(
+                deep_exc
+            ):
+
+                raw_final = {
+                    "skill": notes.skill,
+                    "score": notes.score_estimate,
+                    "strengths": notes.strengths,
+                    "weaknesses": notes.weaknesses,
+                    "evidence": notes.evidence,
+                    "feedback": notes.key_reason,
+                    "recommended_action": (
+                        "Address the main weakness and "
+                        "resubmit evidence."
+                    ),
+                }
+
+            else:
+
+                raise
+
         assessment = AssessmentResult.model_validate(
-            raw_result
+            raw_final
         )
 
         skill_name = normalize_skill_name(
             assessment.skill
         )
 
-        if skill_name not in ui_state["skills"]:
-            ui_state["skills"][skill_name] = {
+        if skill_name not in ui_state[
+            "skills"
+        ]:
+
+            ui_state[
+                "skills"
+            ][skill_name] = {
                 "mastery": 0.0,
                 "confidence": 0.3,
                 "evidence": [],
                 "assessment_scores": [],
             }
 
-        skill = ui_state["skills"][skill_name]
+        record = ui_state[
+            "skills"
+        ][skill_name]
 
         old_mastery = float(
-            skill["mastery"]
+            record["mastery"]
         )
 
-        # Evidence update: assessment contributes,
-        # but does not completely overwrite prior mastery.
         alpha = 0.30
 
-        new_mastery = (
-            (1 - alpha) * old_mastery
-            + alpha * assessment.score
-        )
-
-        skill["mastery"] = round(
+        record["mastery"] = round(
             max(
                 0.0,
                 min(
                     1.0,
-                    new_mastery,
+                    (
+                        (1 - alpha)
+                        * old_mastery
+                    )
+                    + (
+                        alpha
+                        * assessment.score
+                    ),
                 ),
             ),
             3,
         )
 
-        skill["assessment_scores"].append(
+        record[
+            "assessment_scores"
+        ].append(
             assessment.score
         )
 
-        skill["evidence"].extend(
+        record[
+            "evidence"
+        ].extend(
             assessment.evidence
         )
 
-        ui_state["latest_assessment"] = (
-            assessment.model_dump()
-        )
+        ui_state[
+            "latest_assessment"
+        ] = assessment.model_dump()
 
-        ui_state["completed_tasks"].append(
-            {
-                "title": task.title,
-                "skill": task.skill,
-                "score": assessment.score,
-                "feedback": assessment.feedback,
-            }
-        )
+        ui_state[
+            "completed_tasks"
+        ].append({
+            "title": task.title,
+            "skill": task.skill,
+            "score": assessment.score,
+        })
 
-        # Recalculate gaps deterministically.
-        target_skills = ROLE_SKILLS[
+        # ==================================================
+        # Deterministic gap update
+        # ==================================================
+
+        targets = ROLE_SKILLS[
             ui_state["target_role"]
         ]
 
         new_gaps = []
 
-        for target_skill, target_level in target_skills.items():
-            current_skill = ui_state["skills"].get(
+        for target_skill, target_level in targets.items():
+
+            current_record = ui_state[
+                "skills"
+            ].get(
                 target_skill
             )
 
-            if current_skill:
-                current = current_skill["mastery"]
-                confidence = current_skill["confidence"]
+            if current_record:
+
+                current = current_record[
+                    "mastery"
+                ]
+
+                confidence = current_record[
+                    "confidence"
+                ]
+
             else:
+
                 current = 0.0
                 confidence = 0.0
 
-            new_gaps.append(
-                {
-                    "skill": target_skill,
-                    "current": round(current, 2),
-                    "target": round(target_level, 2),
-                    "gap": round(
-                        max(target_level - current, 0.0),
-                        2,
+            new_gaps.append({
+                "skill": target_skill,
+                "current": round(
+                    current,
+                    2,
+                ),
+                "target": round(
+                    target_level,
+                    2,
+                ),
+                "gap": round(
+                    max(
+                        target_level
+                        - current,
+                        0.0,
                     ),
-                    "confidence": round(confidence, 2),
-                }
-            )
+                    2,
+                ),
+                "confidence": round(
+                    confidence,
+                    2,
+                ),
+            })
 
         new_gaps.sort(
             key=lambda x: x["gap"],
-            reverse=True
+            reverse=True,
         )
 
-        ui_state["gaps"] = new_gaps
-        ui_state["plan_version"] += 1
+        ui_state[
+            "gaps"
+        ] = new_gaps
+
+        ui_state[
+            "plan_version"
+        ] += 1
 
         adaptation = f"""
 ## 🔄 Learning Path Updated
 
-**{skill_name} mastery**
+**{skill_name}**
 
 Before: **{old_mastery:.0%}**  
-After: **{skill["mastery"]:.0%}**
+After: **{record["mastery"]:.0%}**
 
-**Current priority gap:**  
-{new_gaps[0]["skill"] if new_gaps else "None"}
+**Current priority:**  
+{new_gaps[0]["skill"]}
 
-EduPath incorporated the latest assessment evidence and recalculated the remaining gaps.
+The latest assessment evidence was incorporated and the remaining gaps were recalculated.
 """
 
         return (
-            format_assessment(assessment),
+            format_assessment(
+                assessment
+            ),
             adaptation,
-            "## 🎯 Updated Skill Gaps\n\n" + format_gaps(new_gaps),
+            "## 🎯 Updated Skill Gaps\n\n"
+            + format_gaps(
+                new_gaps
+            ),
             ui_state,
         )
 
     except Exception as exc:
+
         return (
-            f"❌ **Assessment failed**\n\n`{type(exc).__name__}: {exc}`",
+            f"❌ **Assessment failed**\n\n"
+            f"`{type(exc).__name__}: {exc}`",
             "",
             "",
             ui_state,
@@ -1215,47 +1437,54 @@ EduPath incorporated the latest assessment evidence and recalculated the remaini
 
 async def ui_replan(ui_state):
     try:
+
         if not ui_state:
-            return "⚠️ Analyze your profile first.", ui_state
+            return (
+                "⚠️ Analyze your profile first.",
+                ui_state,
+            )
+
+        profile = ui_state[
+            "profile"
+        ]
 
         prompt = f"""
-TARGET ROLE:
+TARGET:
 {ui_state["target_role"]}
 
-WEEKLY HOURS:
+HOURS:
 {ui_state["weekly_hours"]}
 
-CURRENT PLAN VERSION:
-{ui_state["plan_version"]}
+SKILLS:
+{json.dumps(list(ui_state["skills"].items())[:8], separators=(",", ":"))}
 
-CURRENT SKILLS:
-{json.dumps(ui_state["skills"], indent=2)}
-
-UPDATED GAPS:
-{json.dumps(ui_state["gaps"], indent=2)}
+TOP GAPS:
+{json.dumps(ui_state["gaps"][:6], separators=(",", ":"))}
 
 LATEST ASSESSMENT:
-{json.dumps(ui_state.get("latest_assessment", {}), indent=2)}
+{json.dumps(ui_state.get("latest_assessment", {}), separators=(",", ":"))}
 
-PREVIOUS PLAN:
-{json.dumps(ui_state.get("learning_plan", {}), indent=2)}
-
-Create a new four-week plan that adapts to the newest evidence.
-Do not unnecessarily repeat demonstrated material.
+Create a NEW compact four-week plan.
+Prioritize the updated gaps.
+Do not repeat strong skills unnecessarily.
 """
 
-        raw_plan = await run_adk_agent(
+        raw = await run_adk_agent(
             planner_agent,
             prompt,
             output_key="learning_plan",
             user_prefix="replan",
+            estimated_output_tokens=300,
+            budget="fast",
         )
 
         plan = LearningPlan.model_validate(
-            raw_plan
+            raw
         )
 
-        ui_state["learning_plan"] = plan.model_dump()
+        ui_state[
+            "learning_plan"
+        ] = plan.model_dump()
 
         return (
             f"## 🔄 Updated Learning Plan · v{ui_state['plan_version']}\n\n"
@@ -1264,6 +1493,7 @@ Do not unnecessarily repeat demonstrated material.
         )
 
     except Exception as exc:
+
         return (
             f"❌ **Replanning failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
@@ -1272,170 +1502,239 @@ Do not unnecessarily repeat demonstrated material.
 
 async def ui_research_resources(ui_state):
     try:
-        if not ui_state:
-            return "⚠️ Analyze your profile first.", ui_state
 
-        gaps = ui_state.get("gaps", [])
+        if not ui_state:
+            return (
+                "⚠️ Analyze your profile first.",
+                ui_state,
+            )
+
+        gaps = ui_state.get(
+            "gaps",
+            [],
+        )
 
         if not gaps:
-            return "No remaining gaps.", ui_state
+            return (
+                "No remaining gaps.",
+                ui_state,
+            )
 
         priority = gaps[0]
 
         query = (
-            f'{priority["skill"]} tutorial course documentation '
-            f'for {ui_state["target_role"]}'
+            f'{priority["skill"]} '
+            f'tutorial course documentation '
+            f'{ui_state["target_role"]}'
         )
 
-        # Lightweight web tool, no LLM needed for search.
-        search_results = await asyncio.to_thread(
-            web_search,
-            query,
-            6,
+        results = await asyncio.to_thread(
+            lambda: list(
+                DDGS().text(
+                    query,
+                    max_results=6,
+                )
+            )
         )
 
-        if not search_results:
+        clean = []
+
+        for item in results:
+
+            url = item.get(
+                "href",
+                "",
+            )
+
+            if not url:
+                continue
+
+            clean.append({
+                "title": item.get(
+                    "title",
+                    "Untitled",
+                ),
+                "url": url,
+                "snippet": (
+                    item.get(
+                        "body",
+                        "",
+                    )[:450]
+                ),
+            })
+
+        if not clean:
+
             return (
-                "⚠️ No web results were returned. Try again.",
+                "⚠️ No web results returned. Try again.",
                 ui_state,
             )
 
-        curator_prompt = f"""
-TARGET SKILL:
-{priority["skill"]}
-
-TARGET ROLE:
-{ui_state["target_role"]}
-
-LEARNER LEVEL:
-Current={priority["current"]}, Target={priority["target"]}
-
-WEB SEARCH RESULTS:
-{json.dumps(search_results, indent=2)}
-
-Select 3-4 high-quality learning resources.
-
-Use ONLY URLs contained in the search results.
-Do not invent or modify URLs.
-Prefer:
-- official documentation
-- universities
-- established learning platforms
-
-Return only ResourceCollection.
-"""
-
-        raw_collection = await run_adk_agent(
-            resource_curator_agent,
-            curator_prompt,
-            output_key="resource_collection",
-            user_prefix="curator",
-        )
-
-        collection = ResourceCollection.model_validate(
-            raw_collection
-        )
-
-        ui_state["recommended_resources"] = [
-            r.model_dump()
-            for r in collection.resources
-        ]
-
         return (
-            format_resources(collection),
+            format_resources(
+                clean[:5],
+                priority["skill"],
+            ),
             ui_state,
         )
 
     except Exception as exc:
+
         return (
-            f"❌ **Research failed**\n\n`{type(exc).__name__}: {exc}`",
+            f"❌ **Research failed**\n\n"
+            f"`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
 
 async def ui_progress(ui_state):
-    try:
-        if not ui_state:
-            return "⚠️ Analyze your profile first.", ui_state
 
-        prompt = f"""
-TARGET ROLE:
-{ui_state["target_role"]}
+    if not ui_state:
 
-PLAN VERSION:
-{ui_state["plan_version"]}
+        return (
+            "⚠️ Analyze your profile first.",
+            ui_state,
+        )
 
-CURRENT SKILLS:
-{json.dumps(ui_state["skills"], indent=2)}
+    text = f"""
+## 📈 Progress Report
 
-COMPLETED TASKS:
-{json.dumps(ui_state["completed_tasks"], indent=2)}
+**Plan version:** {ui_state.get("plan_version", 1)}
 
-LATEST ASSESSMENT:
-{json.dumps(ui_state.get("latest_assessment", {}), indent=2)}
+### Assessed tasks
+**{len(ui_state.get("completed_tasks", []))}**
 
-REMAINING GAPS:
-{json.dumps(ui_state["gaps"], indent=2)}
-
-Generate a concise progress report.
+### Strong / Acquired
 """
 
-        raw_report = await run_adk_agent(
-            progress_agent,
-            prompt,
-            output_key="progress_report",
-            user_prefix="progress",
+    acquired = []
+
+    in_progress = []
+
+    remaining = []
+
+    for skill, target in ROLE_SKILLS[
+        ui_state["target_role"]
+    ].items():
+
+        record = ui_state[
+            "skills"
+        ].get(
+            skill
         )
 
-        report = ProgressReport.model_validate(
-            raw_report
+        mastery = (
+            record["mastery"]
+            if record
+            else 0.0
         )
 
-        ui_state["progress_report"] = (
-            report.model_dump()
-        )
+        if mastery >= 0.85 * target:
 
-        return (
-            format_progress(report),
-            ui_state,
-        )
+            acquired.append(
+                f"{skill} — {mastery:.0%}"
+            )
 
-    except Exception as exc:
-        return (
-            f"❌ **Progress report failed**\n\n`{type(exc).__name__}: {exc}`",
-            ui_state,
+        elif mastery > 0:
+
+            in_progress.append(
+                f"{skill} — {mastery:.0%}"
+            )
+
+        if mastery < target:
+
+            remaining.append(
+                f"{skill} ({mastery:.0%} → {target:.0%})"
+            )
+
+    text += (
+        "\n".join(
+            f"- ✅ {x}"
+            for x in acquired[:8]
         )
+        or "- None yet"
+    )
+
+    text += "\n\n### In Progress\n"
+
+    text += (
+        "\n".join(
+            f"- 🔄 {x}"
+            for x in in_progress[:8]
+        )
+        or "- None yet"
+    )
+
+    text += "\n\n### Remaining Gaps\n"
+
+    text += (
+        "\n".join(
+            f"- {x}"
+            for x in remaining[:8]
+        )
+        or "- None"
+    )
+
+    top_gap = (
+        ui_state["gaps"][0]["skill"]
+        if ui_state.get("gaps")
+        else "None"
+    )
+
+    text += f"""
+
+### Next Step
+
+Focus next on **{top_gap}** and use the next practice task to gather evidence.
+"""
+
+    return (
+        text,
+        ui_state,
+    )
 
 
 async def ui_ask_edupath(
     question,
     ui_state,
 ):
+
     try:
+
         if not ui_state:
             return "⚠️ Analyze your profile first."
 
         if not question.strip():
             return "⚠️ Enter a question."
 
-        context = {
+        compact_state = {
             "target_role": ui_state["target_role"],
             "weekly_hours": ui_state["weekly_hours"],
-            "skills": ui_state["skills"],
-            "gaps": ui_state["gaps"],
-            "learning_plan": ui_state.get("learning_plan"),
-            "current_task": ui_state.get("current_task"),
+            "top_gaps": ui_state["gaps"][:5],
+            "skills": {
+                name: {
+                    "mastery": record["mastery"],
+                    "confidence": record["confidence"],
+                }
+                for name, record
+                in list(
+                    ui_state["skills"].items()
+                )[:8]
+            },
+            "current_task": ui_state.get(
+                "current_task"
+            ),
             "latest_assessment": ui_state.get(
                 "latest_assessment"
             ),
         }
 
         prompt = f"""
-CURRENT EDUPATH STATE:
-{json.dumps(context, indent=2)}
+STATE:
+{json.dumps(compact_state, separators=(",", ":"))}
 
-LEARNER QUESTION:
-{question}
+QUESTION:
+{question[:800]}
 """
 
         return await run_adk_agent(
@@ -1443,9 +1742,12 @@ LEARNER QUESTION:
             prompt,
             output_key=None,
             user_prefix="qa",
+            estimated_output_tokens=160,
+            budget="fast",
         )
 
     except Exception as exc:
+
         return (
             f"❌ **EduPath could not answer**\n\n"
             f"`{type(exc).__name__}: {exc}`"

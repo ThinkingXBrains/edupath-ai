@@ -7,28 +7,44 @@ sdk: gradio
 app_file: app.py
 ---
 
-# 🎓 EduPath — Adaptive Learning Companion
+# 🎓 EduPath — Token-Budgeted Hybrid Learning Agent
 
-EduPath is an agentic AI learning and skill-gap application.
+EduPath personalizes learning using two Groq-hosted LLMs plus deterministic Python state logic.
 
-## Hybrid two-LLM architecture
+## Two-model strategy
 
-EduPath deliberately routes work between two Groq-hosted models:
+### Qwen 3.8 27B
+Used for:
+- learner profile
+- learning plan
+- practice task
+- learner Q&A
 
-- **Qwen 3.8 27B** — default model for learner profiling, planning, practice generation, resource curation, progress reports and learner Q&A.
-- **GPT-OSS 120B** — reserved for the deepest step: learner-work assessment. If the 120B call is rate-limited, the assessment falls back to Qwen 3.8 27B.
+Every prompt and output is deliberately compact. ADK `GenerateContentConfig.max_output_tokens` is used to cap output.
 
-This reduces repeated use of the 120B rate-limit bucket while still demonstrating two-model routing.
+### GPT-OSS 120B
+Used only for deep practice assessment.
+
+The assessment is split into two compact stages:
+
+1. **Deep notes** — small evidence analysis.
+2. **Final assessment** — converts the notes into the final structured schema.
+
+If Stage 2 is rate-limited, the compact notes become a valid deterministic fallback assessment.
+
+## Token protection
+
+A conservative rolling output-token reservation is maintained per model so rapid button clicks do not deliberately burst the free-tier output budget.
 
 ## Research
 
-The app uses the `ddgs` Python package for web search, then the Qwen 3.8 27B Resource Curator converts the search evidence into structured learning resources. No third LLM is required.
+Research uses the `ddgs` web-search package directly and does not consume an LLM generation call.
 
-## Core flow
+## Progress
 
-Profile → Skill Gaps → Plan → Practice → Assessment → Mastery Update → Replan → Research → Progress → Ask.
+Progress reporting is deterministic from the learner state and assessment evidence; no extra LLM call is needed.
 
-## Render deployment
+## Render
 
 Build:
 
@@ -42,21 +58,17 @@ Start:
 python app.py
 ```
 
-Required secret:
+Required environment variable:
 
 ```text
 GROQ_API_KEY
 ```
 
-Never commit the API key to GitHub.
-
-## Environment variables
+Optional model overrides:
 
 ```text
 FAST_MODEL_NAME=groq/qwen/qwen3.8-27b
 DEEP_MODEL_NAME=groq/openai/gpt-oss-120b
 ```
 
-## Important
-
-Learner state is session-based for this hackathon prototype. It is not a permanent database or account system.
+Never commit your Groq API key.

@@ -1,35 +1,32 @@
-# Model Strategy
+# EduPath Model Routing
 
-## Qwen 3.8 27B
+## Current problem
 
-Used for:
-- learner profiling
-- learning-plan generation
-- practice-task generation
-- resource curation
-- progress report
-- learner Q&A
+On the hackathon/free account, Groq can enforce a very small rolling output-token budget. A large response can therefore fail even when the overall daily quota is not exhausted.
 
-Why:
-- current Groq model
-- supports structured outputs
-- supports reasoning
-- lower-cost/lighter workload than GPT-OSS 120B
-- 131K context window
+## Solution
 
-## GPT-OSS 120B
+The app uses:
+- compact schemas
+- compact prompts
+- explicit `max_output_tokens`
+- client-side rolling output reservations
+- two-stage 120B assessment
+- no LLM call for progress
+- no LLM call for web search
 
-Used for:
-- deep assessment of learner submissions
+## Routing
 
-Why:
-- reserve the large model for the most reasoning-heavy stage
-- keep 120B usage small enough to reduce rate-limit pressure
+Qwen 3.8 27B:
+profile, plan, practice, Q&A.
 
-## Fallback
+GPT-OSS 120B:
+assessment notes + final assessment.
 
-If the 120B assessment call is rate-limited, EduPath automatically retries the same assessment using Qwen 3.8 27B.
+Research:
+DDGS web search.
 
-## Research
+Python:
+mastery update, gap calculation, progress report, session state.
 
-Web search is handled separately through DDGS, so research does not consume another LLM model.
+Splitting a prompt only helps when BOTH calls are individually and jointly small enough for the rolling output limit.
