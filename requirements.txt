@@ -4,3 +4,4 @@ litellm>=1.84
 groq
 pydantic
 pypdf
+ddgs>=9.14.4,<10

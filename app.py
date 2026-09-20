@@ -1,12 +1,15 @@
 import os
 import json
 import uuid
-import re
+import asyncio
 from pathlib import Path
+from typing import Any
 
 import gradio as gr
 from pydantic import BaseModel, Field
 from groq import Groq
+from ddgs import DDGS
+
 from google.adk.agents import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
@@ -19,39 +22,22 @@ from google.genai import types
 
 APP_NAME = "edupath"
 
-# Structured agents: strict Pydantic output via ADK/LiteLLM.
-STRUCTURED_MODEL_NAME = os.getenv(
-    "STRUCTURED_MODEL_NAME",
+# Hybrid two-LLM strategy
+FAST_MODEL_NAME = os.getenv(
+    "FAST_MODEL_NAME",
+    "groq/qwen/qwen3.8-27b",
+)
+DEEP_MODEL_NAME = os.getenv(
+    "DEEP_MODEL_NAME",
     "groq/openai/gpt-oss-120b",
-)
-
-# Web-heavy and conversational tasks: Groq Compound Mini.
-RESEARCH_MODEL_NAME = os.getenv(
-    "RESEARCH_MODEL_NAME",
-    "groq/compound-mini",
-)
-QA_MODEL_NAME = os.getenv(
-    "QA_MODEL_NAME",
-    "groq/compound-mini",
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
     raise RuntimeError(
-        "GROQ_API_KEY is missing. Add it as a Hugging Face Space Secret."
+        "GROQ_API_KEY is missing. Add it to your Render Environment Variables."
     )
-
-
-def groq_model():
-    """Shared ADK/LiteLLM model configuration."""
-    return LiteLlm(
-        model=STRUCTURED_MODEL_NAME,
-        api_key=GROQ_API_KEY,
-        reasoning_effort="low",
-        include_reasoning=False,
-    )
-
 
 groq_client = Groq(
     api_key=GROQ_API_KEY,
@@ -59,8 +45,28 @@ groq_client = Groq(
 )
 
 
+def fast_model():
+    # Qwen 3.8 27B supports strict structured outputs and tunable reasoning.
+    return LiteLlm(
+        model=FAST_MODEL_NAME,
+        api_key=GROQ_API_KEY,
+        reasoning_effort="none",
+        include_reasoning=False,
+    )
+
+
+def deep_model():
+    # GPT-OSS 120B is reserved for the hardest assessment stage.
+    return LiteLlm(
+        model=DEEP_MODEL_NAME,
+        api_key=GROQ_API_KEY,
+        reasoning_effort="low",
+        include_reasoning=False,
+    )
+
+
 # ============================================================
-# TARGET ROLE KNOWLEDGE
+# ROLE KNOWLEDGE
 # ============================================================
 
 ROLE_SKILLS = {
@@ -98,8 +104,6 @@ SKILL_ALIASES = {
     "permanent magnet synchronous motors (pmsm)": "PMSM",
     "permanent magnet synchronous motor (pmsm)": "PMSM",
     "pmsm": "PMSM",
-    "pmsm motor": "PMSM",
-    "pmsm motors": "PMSM",
     "field oriented control": "FOC",
     "field-oriented control": "FOC",
     "field oriented control (foc)": "FOC",
@@ -111,10 +115,10 @@ SKILL_ALIASES = {
     "machine learning": "Machine Learning",
     "machine learning (basic)": "Machine Learning",
     "ml": "Machine Learning",
-    "llm": "LLMs",
-    "llms": "LLMs",
     "large language model": "LLMs",
     "large language models": "LLMs",
+    "llm": "LLMs",
+    "llms": "LLMs",
     "agentic ai": "Agentic AI",
     "mcp": "MCP",
     "data analysis": "Data Analysis",
@@ -133,47 +137,47 @@ SKILL_ALIASES = {
 }
 
 
-def normalize_skill_name(name):
+def normalize_skill_name(name: str) -> str:
     key = " ".join(name.strip().lower().split())
     return SKILL_ALIASES.get(key, name.strip())
 
 
-def calculate_skill_gaps(profile, target_role):
+def calculate_skill_gaps(profile, target_role: str):
     target_skills = ROLE_SKILLS[target_role]
 
-    current_skills = {
+    current = {
         normalize_skill_name(skill.name): skill
         for skill in profile.skills
     }
 
-    results = []
+    gaps = []
 
-    for skill_name, target_level in target_skills.items():
-        skill = current_skills.get(skill_name)
+    for skill_name, target in target_skills.items():
+        item = current.get(skill_name)
 
-        if skill:
-            current = skill.proficiency
-            confidence = skill.confidence
+        if item:
+            mastery = float(item.proficiency)
+            confidence = float(item.confidence)
         else:
-            current = 0.0
+            mastery = 0.0
             confidence = 0.0
 
-        results.append(
+        gaps.append(
             {
                 "skill": skill_name,
-                "current": round(current, 2),
-                "target": round(target_level, 2),
-                "gap": round(max(target_level - current, 0.0), 2),
+                "current": round(mastery, 2),
+                "target": round(target, 2),
+                "gap": round(max(target - mastery, 0.0), 2),
                 "confidence": round(confidence, 2),
             }
         )
 
-    results.sort(key=lambda x: x["gap"], reverse=True)
-    return results
+    gaps.sort(key=lambda x: x["gap"], reverse=True)
+    return gaps
 
 
 # ============================================================
-# STRUCTURED SCHEMAS
+# SCHEMAS
 # ============================================================
 
 class Skill(BaseModel):
@@ -262,36 +266,25 @@ class ProgressReport(BaseModel):
 
 
 # ============================================================
-# AGENTS
+# AGENTS — HYBRID ROUTING
 # ============================================================
 
+# FAST / EFFICIENT MODEL:
+# Qwen 3.8 27B is used for most structured and conversational work.
 profile_agent = LlmAgent(
     name="profile_agent",
-    model=groq_model(),
-    description="Builds a structured learner capability profile.",
+    model=fast_model(),
+    description="Creates an evidence-grounded learner profile.",
     instruction="""
 You are EduPath's Profile Analyst.
 
-Analyze the learner information and return a realistic structured learner profile.
+Create a structured learner profile from the supplied information.
 
-Identify:
-- target role
-- years of experience
-- career goals
-- available learning time
-- existing skills
-
-For every skill:
-- proficiency: 0.0 to 1.0
-- confidence: 0.0 to 1.0
-- evidence: concrete evidence from the input
-
-Rules:
-1. Never invent experience or certifications.
-2. Never claim expertise without evidence.
-3. Distinguish proficiency from confidence.
-4. Only include skills supported by the learner information.
-5. Use the requested target role, experience and weekly hours when provided.
+Use only evidence present in the input.
+Do not invent skills, experience, certifications, or achievements.
+Separate proficiency from confidence.
+Use concrete evidence for every skill.
+Be conservative when evidence is weak.
 
 Return only the structured output.
 """,
@@ -302,20 +295,25 @@ Return only the structured output.
 
 planner_agent = LlmAgent(
     name="planner_agent",
-    model=groq_model(),
-    description="Creates a personalized learning plan.",
+    model=fast_model(),
+    description="Builds a personalized four-week learning plan.",
     instruction="""
 You are EduPath's Learning Planner.
 
-Create a practical 4-week learning journey from the supplied learner state.
+Create a realistic 4-week learning plan based on the learner's:
+- target role
+- current skills
+- proficiency
+- confidence
+- remaining gaps
+- weekly learning time
 
 Prioritize meaningful gaps.
-Leverage existing strengths.
-Respect weekly learning hours.
-Avoid reteaching skills already demonstrated strongly.
-Include topics, hands-on practice, deliverables and assessments.
+Leverage existing domain strengths.
+Avoid spending large amounts of time reteaching demonstrated skills.
+Make each week practical and measurable.
 
-Return only the structured learning plan.
+Return only the structured output.
 """,
     output_schema=LearningPlan,
     output_key="learning_plan",
@@ -324,45 +322,71 @@ Return only the structured learning plan.
 
 practice_agent = LlmAgent(
     name="practice_agent",
-    model=groq_model(),
-    description="Creates hands-on practice tasks.",
+    model=fast_model(),
+    description="Creates a practical hands-on task for the learner's current gap.",
     instruction="""
 You are EduPath's Practice Task Generator.
 
-Create one practical, project-oriented task targeting the learner's highest priority gap.
+Create one practical, project-oriented task for the learner's priority gap.
 
 Match difficulty to the learner's current level.
-Leverage domain knowledge when useful.
-Produce a concrete deliverable.
-Keep the task achievable in the available learning time.
+Leverage their existing domain knowledge when useful.
+Keep it achievable within the available weekly time.
+Provide a concrete deliverable and measurable success criteria.
 
-Return only the structured practice task.
+Return only the structured output.
 """,
     output_schema=PracticeTask,
     output_key="practice_task",
 )
 
 
-assessment_agent = LlmAgent(
-    name="assessment_agent",
-    model=groq_model(),
-    description="Assesses learner submissions using evidence.",
+# DEEP MODEL:
+# GPT-OSS 120B is reserved for the highest-value reasoning step.
+assessment_agent_deep = LlmAgent(
+    name="assessment_agent_deep",
+    model=deep_model(),
+    description="Performs evidence-grounded deep assessment of learner work.",
+    instruction="""
+You are EduPath's Deep Assessment Agent.
+
+Evaluate the learner's submission against the assigned practice task.
+
+Assess:
+- conceptual correctness
+- technical correctness
+- completeness
+- practical execution
+- task success criteria
+
+Use only evidence supplied in the submission.
+Do not assume missing work was completed.
+Give a score from 0.0 to 1.0.
+Be precise and constructive.
+
+Return only the structured output.
+""",
+    output_schema=AssessmentResult,
+    output_key="assessment_result",
+)
+
+
+# FAST FALLBACK:
+# If the deep model is rate-limited, Qwen can still complete the assessment.
+assessment_agent_fast = LlmAgent(
+    name="assessment_agent_fast",
+    model=fast_model(),
+    description="Fallback assessment agent.",
     instruction="""
 You are EduPath's Assessment Agent.
 
-Evaluate the learner submission against the practice task.
+Evaluate the learner's submission against the assigned practice task.
+Use only submitted evidence.
+Do not invent completed work.
+Return a score from 0.0 to 1.0 and specific strengths, weaknesses,
+evidence, feedback and the next action.
 
-Assess correctness, completeness, understanding and success criteria.
-
-Rules:
-1. Use only evidence in the submission.
-2. Do not assume unreported work was completed.
-3. Provide a score from 0.0 to 1.0.
-4. Identify strengths, weaknesses and evidence.
-5. Give constructive feedback.
-6. Recommend a concrete next action.
-
-Return only the structured assessment.
+Return only the structured output.
 """,
     output_schema=AssessmentResult,
     output_key="assessment_result",
@@ -371,21 +395,21 @@ Return only the structured assessment.
 
 resource_curator_agent = LlmAgent(
     name="resource_curator_agent",
-    model=groq_model(),
-    description="Curates verified learning resources.",
+    model=fast_model(),
+    description="Converts web-search evidence into curated learning resources.",
     instruction="""
 You are EduPath's Resource Curator.
 
-Extract useful learning resources from supplied research.
+You receive web-search results and verified URLs.
+
+Select 3-4 resources that best match the learner's skill gap and level.
 
 Rules:
-1. Return 3-4 resources when valid resources are available.
-2. Use ONLY URLs supplied in the research.
-3. Never invent or modify URLs.
-4. Match resources to the learner's gap and level.
-5. Remove duplicates.
-
-Return only ResourceCollection.
+1. Use only URLs present in the supplied search results.
+2. Do not invent or alter URLs.
+3. Remove duplicates.
+4. Prefer official documentation, universities and established learning platforms.
+5. Return only the structured ResourceCollection.
 """,
     output_schema=ResourceCollection,
     output_key="resource_collection",
@@ -394,22 +418,21 @@ Return only ResourceCollection.
 
 progress_agent = LlmAgent(
     name="progress_agent",
-    model=groq_model(),
-    description="Generates learner progress reports.",
+    model=fast_model(),
+    description="Generates a concise progress report from learner state.",
     instruction="""
 You are EduPath's Progress Analyst.
 
-Use the learner state and assessment history to produce a concise report.
+Use the supplied learner state, assessments and gaps.
 
-Classify skills as:
-- Acquired: demonstrated strong mastery
-- In Progress: meaningful evidence but target not reached
+Classify:
+- Acquired: strong demonstrated mastery
+- In Progress: evidence exists but target is not reached
 
-Also identify remaining gaps and actionable next steps.
+Also report remaining gaps and specific next steps.
 
 Do not invent achievements.
-
-Return only ProgressReport.
+Return only the structured output.
 """,
     output_schema=ProgressReport,
     output_key="progress_report",
@@ -417,30 +440,42 @@ Return only ProgressReport.
 
 
 qa_agent = LlmAgent(
-    name="edupath_qa_agent",
-    model=groq_model(),
-    description="Answers questions about the learner journey.",
+    name="qa_agent",
+    model=fast_model(),
+    description="Answers learner questions using current EduPath state.",
     instruction="""
 You are EduPath's Learning Companion.
 
-Answer the learner using the supplied current journey context.
+Answer the learner using the supplied learner state.
 Be practical and concise.
-Do not invent scores, skills, achievements or resources.
+Do not invent scores, achievements, skills or resources.
 """,
 )
 
 
 # ============================================================
-# ADK RUNNER HELPER
+# ADK RUNNER
 # ============================================================
 
-async def run_adk_agent(agent, message_text, output_key=None, user_prefix="edupath"):
-    """
-    Run an ADK agent and retry once if Groq reports a retryable
-    token-rate-limit interval.
-    """
-    import asyncio
+def is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "rate limit" in text
+        or "rate_limit" in text
+        or "tokens per minute" in text
+        or "429" in text
+    )
 
+
+async def run_adk_agent(
+    agent,
+    message_text: str,
+    output_key: str | None = None,
+    user_prefix: str = "edupath",
+):
+    """
+    Run an ADK agent in a short-lived in-memory session.
+    """
     user_id = f"{user_prefix}_{uuid.uuid4().hex[:8]}"
 
     runner = InMemoryRunner(
@@ -455,66 +490,83 @@ async def run_adk_agent(agent, message_text, output_key=None, user_prefix="edupa
 
     message = types.Content(
         role="user",
-        parts=[types.Part.from_text(text=message_text)],
+        parts=[
+            types.Part.from_text(
+                text=message_text
+            )
+        ],
     )
 
-    for attempt in range(2):
-        try:
-            events = []
+    events = []
 
-            async for event in runner.run_async(
-                user_id=user_id,
-                session_id=session.id,
-                new_message=message,
-            ):
-                events.append(event)
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session.id,
+        new_message=message,
+    ):
+        events.append(event)
 
-            if output_key:
-                state = await runner.session_service.get_session(
-                    app_name=APP_NAME,
-                    user_id=user_id,
-                    session_id=session.id,
-                )
+    if output_key:
+        state = await runner.session_service.get_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=session.id,
+        )
 
-                result = state.state.get(output_key)
+        result = state.state.get(output_key)
 
-                if isinstance(result, str):
-                    result = json.loads(result)
+        if isinstance(result, str):
+            result = json.loads(result)
 
-                return result
+        return result
 
-            text_parts = []
+    text_parts = []
 
-            for event in events:
-                if event.is_final_response() and event.content:
-                    for part in event.content.parts:
-                        if part.text:
-                            text_parts.append(part.text)
+    for event in events:
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if part.text:
+                    text_parts.append(part.text)
 
-            return "\n".join(text_parts)
+    return "\n".join(text_parts)
 
-        except Exception as exc:
-            text = str(exc)
-            match = re.search(
-                r"try again in\s*([0-9]+(?:\.[0-9]+)?)s",
-                text,
-                flags=re.IGNORECASE,
-            )
 
-            if attempt == 0 and match:
-                seconds = min(float(match.group(1)) + 0.5, 30.0)
-                await asyncio.sleep(seconds)
-                continue
-
+async def run_with_fallback(
+    primary_agent,
+    fallback_agent,
+    message_text,
+    output_key,
+    user_prefix,
+):
+    try:
+        return await run_adk_agent(
+            primary_agent,
+            message_text,
+            output_key=output_key,
+            user_prefix=user_prefix,
+        )
+    except Exception as primary_error:
+        # Fallback is intentionally used for quota/rate-limit errors.
+        if not is_rate_limit_error(primary_error):
             raise
+
+        return await run_adk_agent(
+            fallback_agent,
+            message_text,
+            output_key=output_key,
+            user_prefix=f"{user_prefix}_fallback",
+        )
 
 
 # ============================================================
 # FORMATTERS
 # ============================================================
 
-def format_profile(profile):
-    goals = "\n".join(f"- {x}" for x in profile.goals) or "- —"
+def format_profile(profile: LearnerProfile) -> str:
+    goals = "\n".join(
+        f"- {goal}"
+        for goal in profile.goals
+    ) or "- —"
 
     return f"""
 ## 👤 Learner Profile
@@ -533,10 +585,11 @@ def format_profile(profile):
 """
 
 
-def format_gaps(gaps, limit=None):
-    items = gaps[:limit] if limit else gaps
+def format_gaps(gaps, top_n=None) -> str:
+    items = gaps[:top_n] if top_n else gaps
 
     rows = []
+
     for item in items:
         current = item["current"]
         target = item["target"]
@@ -544,14 +597,18 @@ def format_gaps(gaps, limit=None):
         bar = "█" * filled + "░" * (20 - filled)
 
         rows.append(
-            f"{item['skill']:25s} {bar} "
-            f"{int(current*100):>3}% → {int(target*100):>3}%"
+            f"{item['skill']:25s} "
+            f"{bar} "
+            f"{int(current * 100):>3}% → {int(target * 100):>3}%"
         )
+
+    if not rows:
+        return "No skill gaps available."
 
     return "```text\n" + "\n".join(rows) + "\n```"
 
 
-def format_plan(plan):
+def format_plan(plan: LearningPlan) -> str:
     text = f"""
 ## 📚 Personalized Learning Plan
 
@@ -559,30 +616,42 @@ def format_plan(plan):
 """
 
     for week in plan.weeks:
-        topics = "\n".join(f"- {x}" for x in week.topics)
-        practice = "\n".join(f"- {x}" for x in week.practice_tasks)
+        topics = "\n".join(
+            f"- {x}"
+            for x in week.topics
+        )
+
+        practice = "\n".join(
+            f"- {x}"
+            for x in week.practice_tasks
+        )
 
         text += f"""
 ### Week {week.week}
-**Objective:** {week.objective}
 
-**Topics**
+**Objective**  
+{week.objective}
+
+**Topics**  
 {topics}
 
-**Practice**
+**Practice**  
 {practice}
 
-**Deliverable:** {week.deliverable}
+**Deliverable**  
+{week.deliverable}
 
-**Assessment:** {week.assessment}
+**Assessment**  
+{week.assessment}
 
 **Estimated time:** {week.estimated_hours:.1f} hours
+
 """
 
     return text
 
 
-def format_task(task):
+def format_task(task: PracticeTask) -> str:
     instructions = "\n".join(
         f"{i}. {x}"
         for i, x in enumerate(task.instructions, 1)
@@ -594,34 +663,41 @@ def format_task(task):
     )
 
     return f"""
-## 🛠️ Current Practice
+## 🛠️ Current Practice Task
 
 ### {task.title}
 
 **Skill:** {task.skill} · **{task.difficulty}** · **{task.estimated_hours:.1f} hrs**
 
-**Objective**  
+### Objective
 {task.objective}
 
-**Instructions**
+### Instructions
 {instructions}
 
-**Deliverable**  
+### Deliverable
 {task.deliverable}
 
-**Success criteria**
+### Success Criteria
 {criteria}
 """
 
 
-def format_assessment(result):
-    strengths = "\n".join(f"- {x}" for x in result.strengths)
-    weaknesses = "\n".join(f"- {x}" for x in result.weaknesses)
+def format_assessment(result: AssessmentResult) -> str:
+    strengths = "\n".join(
+        f"- {x}"
+        for x in result.strengths
+    )
+
+    weaknesses = "\n".join(
+        f"- {x}"
+        for x in result.weaknesses
+    )
 
     return f"""
 ## 📝 Assessment
 
-### {result.score:.0%} — {result.skill}
+### {result.score:.0%} · {result.skill}
 
 **Strengths**
 {strengths}
@@ -629,39 +705,40 @@ def format_assessment(result):
 **Areas to improve**
 {weaknesses}
 
-**Feedback**
-
+### Feedback
 {result.feedback}
 
-**Next action**
-
+### Next action
 {result.recommended_action}
 """
 
 
-def format_resources(collection):
+def format_resources(collection: ResourceCollection) -> str:
     text = f"""
 ## 🔎 Recommended Resources
 
 **Current focus:** {collection.skill}
 """
 
-    for i, r in enumerate(collection.resources, 1):
+    for i, resource in enumerate(
+        collection.resources,
+        1,
+    ):
         text += f"""
+### {i}. {resource.title}
 
-### {i}. {r.title}
+**{resource.provider}** · {resource.difficulty} · {resource.estimated_hours:.1f} hrs · {resource.cost}
 
-**{r.provider}** · {r.difficulty} · {r.estimated_hours:.1f} hrs · {r.cost}
+{resource.relevance}
 
-{r.relevance}
+🔗 {resource.url}
 
-🔗 {r.url}
 """
 
     return text
 
 
-def format_progress(report):
+def format_progress(report: ProgressReport) -> str:
     acquired = "\n".join(
         f"- ✅ {x.skill} — {x.mastery:.0%}"
         for x in report.skills_acquired
@@ -672,7 +749,10 @@ def format_progress(report):
         for x in report.skills_in_progress
     ) or "- None yet"
 
-    gaps = "\n".join(f"- {x}" for x in report.remaining_gaps) or "- None"
+    remaining = "\n".join(
+        f"- {x}"
+        for x in report.remaining_gaps
+    ) or "- None"
 
     next_steps = "\n".join(
         f"- {x}"
@@ -694,11 +774,40 @@ def format_progress(report):
 {in_progress}
 
 ### Remaining gaps
-{gaps}
+{remaining}
 
 ### Recommended next steps
 {next_steps}
 """
+
+
+# ============================================================
+# RESEARCH TOOL — NO SECOND LLM NEEDED
+# ============================================================
+
+def web_search(query: str, max_results: int = 6) -> list[dict[str, Any]]:
+    """
+    Search the public web through DDGS.
+    Returns title, url and snippet for downstream curation.
+    """
+    results = DDGS().text(
+        query,
+        max_results=max_results,
+        backend="auto",
+    )
+
+    clean = []
+
+    for item in results:
+        clean.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("href", ""),
+                "snippet": item.get("body", ""),
+            }
+        )
+
+    return clean
 
 
 # ============================================================
@@ -730,6 +839,7 @@ async def ui_analyze_profile(
                 from pypdf import PdfReader
 
                 reader = PdfReader(path)
+
                 resume_text = "\n".join(
                     page.extract_text() or ""
                     for page in reader.pages
@@ -741,7 +851,7 @@ async def ui_analyze_profile(
                     errors="ignore",
                 )
 
-        learner_input = f"""
+        prompt = f"""
 Target role:
 {target_role}
 
@@ -754,29 +864,36 @@ Available learning time:
 Learner background:
 {learner_background}
 
-Resume / portfolio content:
+Resume / portfolio:
 {resume_text[:12000]}
 """
 
         raw_profile = await run_adk_agent(
             profile_agent,
-            learner_input,
+            prompt,
             output_key="learner_profile",
             user_prefix="profile",
         )
 
-        profile = LearnerProfile.model_validate(raw_profile)
+        profile = LearnerProfile.model_validate(
+            raw_profile
+        )
 
+        # UI fields are authoritative.
         profile.target_role = target_role
         profile.experience_years = float(experience_years)
         profile.weekly_hours = float(weekly_hours)
 
-        gaps = calculate_skill_gaps(profile, target_role)
+        gaps = calculate_skill_gaps(
+            profile,
+            target_role,
+        )
 
         skills = {}
 
         for skill in profile.skills:
             name = normalize_skill_name(skill.name)
+
             skills[name] = {
                 "mastery": skill.proficiency,
                 "confidence": skill.confidence,
@@ -801,13 +918,14 @@ Resume / portfolio content:
 
         return (
             format_profile(profile),
-            "## 🎯 Skill Gap Analysis\n\n" + format_gaps(gaps),
+            "## 🎯 Skill Gap Map\n\n" + format_gaps(gaps),
             state,
         )
 
-    except Exception as e:
+    except Exception as exc:
         return (
-            f"❌ **Profile analysis failed**\n\n`{type(e).__name__}: {e}`",
+            f"❌ **Profile analysis failed**\n\n"
+            f"`{type(exc).__name__}: {exc}`",
             "",
             ui_state,
         )
@@ -831,13 +949,13 @@ EXPERIENCE:
 WEEKLY HOURS:
 {profile["weekly_hours"]}
 
-SKILLS:
+CURRENT SKILLS:
 {json.dumps(profile["skills"], indent=2)}
 
-SKILL GAPS:
+CURRENT GAPS:
 {json.dumps(gaps, indent=2)}
 
-Create a realistic four-week personalized learning plan.
+Create a realistic four-week plan.
 """
 
         raw_plan = await run_adk_agent(
@@ -847,16 +965,20 @@ Create a realistic four-week personalized learning plan.
             user_prefix="planner",
         )
 
-        plan = LearningPlan.model_validate(raw_plan)
+        plan = LearningPlan.model_validate(
+            raw_plan
+        )
 
         ui_state["learning_plan"] = plan.model_dump()
-        ui_state["plan_version"] = max(1, ui_state.get("plan_version", 1))
 
-        return format_plan(plan), ui_state
-
-    except Exception as e:
         return (
-            f"❌ **Plan generation failed**\n\n`{type(e).__name__}: {e}`",
+            format_plan(plan),
+            ui_state,
+        )
+
+    except Exception as exc:
+        return (
+            f"❌ **Plan generation failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
@@ -866,10 +988,12 @@ async def ui_generate_practice(ui_state):
         if not ui_state:
             return "⚠️ Analyze your profile first.", ui_state
 
-        if not ui_state.get("gaps"):
-            return "⚠️ No skill gaps are available.", ui_state
+        gaps = ui_state.get("gaps", [])
 
-        priority = ui_state["gaps"][0]
+        if not gaps:
+            return "⚠️ No current gaps are available.", ui_state
+
+        priority = gaps[0]
 
         prompt = f"""
 TARGET ROLE:
@@ -884,7 +1008,7 @@ PRIORITY GAP:
 CURRENT SKILLS:
 {json.dumps(ui_state["profile"]["skills"], indent=2)}
 
-Create one practical hands-on task for this learner.
+Create one practical hands-on task.
 """
 
         raw_task = await run_adk_agent(
@@ -894,29 +1018,47 @@ Create one practical hands-on task for this learner.
             user_prefix="practice",
         )
 
-        task = PracticeTask.model_validate(raw_task)
+        task = PracticeTask.model_validate(
+            raw_task
+        )
 
         ui_state["current_task"] = task.model_dump()
 
-        return format_task(task), ui_state
-
-    except Exception as e:
         return (
-            f"❌ **Practice generation failed**\n\n`{type(e).__name__}: {e}`",
+            format_task(task),
+            ui_state,
+        )
+
+    except Exception as exc:
+        return (
+            f"❌ **Practice generation failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
 
-async def ui_assess_and_adapt(learner_submission, ui_state):
+async def ui_assess_and_adapt(
+    learner_submission,
+    ui_state,
+):
     try:
         if not ui_state:
             return "⚠️ Analyze your profile first.", "", "", ui_state
 
         if not ui_state.get("current_task"):
-            return "⚠️ Generate a practice task first.", "", "", ui_state
+            return (
+                "⚠️ Generate a practice task first.",
+                "",
+                "",
+                ui_state,
+            )
 
         if not learner_submission.strip():
-            return "⚠️ Submit your work first.", "", "", ui_state
+            return (
+                "⚠️ Submit some work first.",
+                "",
+                "",
+                ui_state,
+            )
 
         task = PracticeTask.model_validate(
             ui_state["current_task"]
@@ -928,20 +1070,23 @@ PRACTICE TASK:
 
 LEARNER SUBMISSION:
 {learner_submission}
-
-Evaluate the submission using only the available evidence.
 """
 
-        raw = await run_adk_agent(
-            assessment_agent,
+        raw_result = await run_with_fallback(
+            assessment_agent_deep,
+            assessment_agent_fast,
             prompt,
             output_key="assessment_result",
             user_prefix="assessment",
         )
 
-        assessment = AssessmentResult.model_validate(raw)
+        assessment = AssessmentResult.model_validate(
+            raw_result
+        )
 
-        skill_name = normalize_skill_name(assessment.skill)
+        skill_name = normalize_skill_name(
+            assessment.skill
+        )
 
         if skill_name not in ui_state["skills"]:
             ui_state["skills"][skill_name] = {
@@ -952,7 +1097,13 @@ Evaluate the submission using only the available evidence.
             }
 
         skill = ui_state["skills"][skill_name]
-        old_mastery = skill["mastery"]
+
+        old_mastery = float(
+            skill["mastery"]
+        )
+
+        # Evidence update: assessment contributes,
+        # but does not completely overwrite prior mastery.
         alpha = 0.30
 
         new_mastery = (
@@ -961,7 +1112,14 @@ Evaluate the submission using only the available evidence.
         )
 
         skill["mastery"] = round(
-            max(0.0, min(1.0, new_mastery)), 3
+            max(
+                0.0,
+                min(
+                    1.0,
+                    new_mastery,
+                ),
+            ),
+            3,
         )
 
         skill["assessment_scores"].append(
@@ -970,6 +1128,10 @@ Evaluate the submission using only the available evidence.
 
         skill["evidence"].extend(
             assessment.evidence
+        )
+
+        ui_state["latest_assessment"] = (
+            assessment.model_dump()
         )
 
         ui_state["completed_tasks"].append(
@@ -981,10 +1143,7 @@ Evaluate the submission using only the available evidence.
             }
         )
 
-        ui_state["latest_assessment"] = (
-            assessment.model_dump()
-        )
-
+        # Recalculate gaps deterministically.
         target_skills = ROLE_SKILLS[
             ui_state["target_role"]
         ]
@@ -1032,11 +1191,10 @@ Evaluate the submission using only the available evidence.
 Before: **{old_mastery:.0%}**  
 After: **{skill["mastery"]:.0%}**
 
-**New priority gap:**  
+**Current priority gap:**  
 {new_gaps[0]["skill"] if new_gaps else "None"}
 
-The latest assessment evidence has been incorporated
-and the learner's remaining gaps have been recalculated.
+EduPath incorporated the latest assessment evidence and recalculated the remaining gaps.
 """
 
         return (
@@ -1046,9 +1204,9 @@ and the learner's remaining gaps have been recalculated.
             ui_state,
         )
 
-    except Exception as e:
+    except Exception as exc:
         return (
-            f"❌ **Assessment failed**\n\n`{type(e).__name__}: {e}`",
+            f"❌ **Assessment failed**\n\n`{type(exc).__name__}: {exc}`",
             "",
             "",
             ui_state,
@@ -1067,7 +1225,7 @@ TARGET ROLE:
 WEEKLY HOURS:
 {ui_state["weekly_hours"]}
 
-PLAN VERSION:
+CURRENT PLAN VERSION:
 {ui_state["plan_version"]}
 
 CURRENT SKILLS:
@@ -1082,9 +1240,8 @@ LATEST ASSESSMENT:
 PREVIOUS PLAN:
 {json.dumps(ui_state.get("learning_plan", {}), indent=2)}
 
-Create a new four-week plan.
-Adapt it to the learner's latest demonstrated performance.
-Do not repeat demonstrated material unnecessarily.
+Create a new four-week plan that adapts to the newest evidence.
+Do not unnecessarily repeat demonstrated material.
 """
 
         raw_plan = await run_adk_agent(
@@ -1094,17 +1251,21 @@ Do not repeat demonstrated material unnecessarily.
             user_prefix="replan",
         )
 
-        plan = LearningPlan.model_validate(raw_plan)
+        plan = LearningPlan.model_validate(
+            raw_plan
+        )
+
+        ui_state["learning_plan"] = plan.model_dump()
 
         return (
             f"## 🔄 Updated Learning Plan · v{ui_state['plan_version']}\n\n"
             + format_plan(plan),
-            {**ui_state, "learning_plan": plan.model_dump()},
+            ui_state,
         )
 
-    except Exception as e:
+    except Exception as exc:
         return (
-            f"❌ **Replanning failed**\n\n`{type(e).__name__}: {e}`",
+            f"❌ **Replanning failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
@@ -1117,54 +1278,27 @@ async def ui_research_resources(ui_state):
         gaps = ui_state.get("gaps", [])
 
         if not gaps:
-            return "No remaining gaps to research.", ui_state
+            return "No remaining gaps.", ui_state
 
         priority = gaps[0]
 
-        prompt = f"""
-Find four high-quality learning resources for this learner.
-
-Target role: {ui_state["target_role"]}
-Priority skill gap: {priority["skill"]}
-Current level: {priority["current"]}
-Target level: {priority["target"]}
-
-For each resource provide:
-- Title
-- Provider
-- Full URL
-- Difficulty
-- Estimated hours
-- Free/Paid
-- Why relevant
-
-Prefer official documentation, university material, and established platforms.
-Use actual URLs. Do not invent URLs. Keep the response concise.
-"""
-
-        # Compound Mini performs the web search server-side.
-        response = groq_client.chat.completions.create(
-            model=RESEARCH_MODEL_NAME,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            compound_custom={
-                "tools": {
-                    "enabled_tools": ["web_search"]
-                }
-            },
-            max_tokens=1200,
+        query = (
+            f'{priority["skill"]} tutorial course documentation '
+            f'for {ui_state["target_role"]}'
         )
 
-        research_text = response.choices[0].message.content or ""
-
-        urls = re.findall(
-            r'https?://[^\s\]\)>,"]+',
-            research_text,
+        # Lightweight web tool, no LLM needed for search.
+        search_results = await asyncio.to_thread(
+            web_search,
+            query,
+            6,
         )
+
+        if not search_results:
+            return (
+                "⚠️ No web results were returned. Try again.",
+                ui_state,
+            )
 
         curator_prompt = f"""
 TARGET SKILL:
@@ -1173,15 +1307,21 @@ TARGET SKILL:
 TARGET ROLE:
 {ui_state["target_role"]}
 
-RESEARCH RESULTS:
-{research_text}
+LEARNER LEVEL:
+Current={priority["current"]}, Target={priority["target"]}
 
-VERIFIED URLS:
-{json.dumps(urls, indent=2)}
+WEB SEARCH RESULTS:
+{json.dumps(search_results, indent=2)}
 
-Select 3-4 useful learning resources.
-Use ONLY URLs supplied above.
-Do not invent or alter URLs.
+Select 3-4 high-quality learning resources.
+
+Use ONLY URLs contained in the search results.
+Do not invent or modify URLs.
+Prefer:
+- official documentation
+- universities
+- established learning platforms
+
 Return only ResourceCollection.
 """
 
@@ -1189,7 +1329,7 @@ Return only ResourceCollection.
             resource_curator_agent,
             curator_prompt,
             output_key="resource_collection",
-            user_prefix="resources",
+            user_prefix="curator",
         )
 
         collection = ResourceCollection.model_validate(
@@ -1201,19 +1341,14 @@ Return only ResourceCollection.
             for r in collection.resources
         ]
 
-        return format_resources(collection), ui_state
-
-    except Exception as e:
-        text = str(e).lower()
-
-        if "rate limit" in text or "tokens per minute" in text:
-            return (
-                "⏳ **Groq rate limit reached.** Please wait a few seconds and try again.",
-                ui_state,
-            )
-
         return (
-            f"❌ **Research failed**\n\n`{type(e).__name__}: {e}`",
+            format_resources(collection),
+            ui_state,
+        )
+
+    except Exception as exc:
+        return (
+            f"❌ **Research failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
@@ -1242,7 +1377,7 @@ LATEST ASSESSMENT:
 REMAINING GAPS:
 {json.dumps(ui_state["gaps"], indent=2)}
 
-Generate the learner's current progress report.
+Generate a concise progress report.
 """
 
         raw_report = await run_adk_agent(
@@ -1256,18 +1391,26 @@ Generate the learner's current progress report.
             raw_report
         )
 
-        ui_state["progress_report"] = report.model_dump()
+        ui_state["progress_report"] = (
+            report.model_dump()
+        )
 
-        return format_progress(report), ui_state
-
-    except Exception as e:
         return (
-            f"❌ **Progress report failed**\n\n`{type(e).__name__}: {e}`",
+            format_progress(report),
+            ui_state,
+        )
+
+    except Exception as exc:
+        return (
+            f"❌ **Progress report failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
 
-async def ui_ask_edupath(question, ui_state):
+async def ui_ask_edupath(
+    question,
+    ui_state,
+):
     try:
         if not ui_state:
             return "⚠️ Analyze your profile first."
@@ -1282,7 +1425,9 @@ async def ui_ask_edupath(question, ui_state):
             "gaps": ui_state["gaps"],
             "learning_plan": ui_state.get("learning_plan"),
             "current_task": ui_state.get("current_task"),
-            "latest_assessment": ui_state.get("latest_assessment"),
+            "latest_assessment": ui_state.get(
+                "latest_assessment"
+            ),
         }
 
         prompt = f"""
@@ -1291,124 +1436,102 @@ CURRENT EDUPATH STATE:
 
 LEARNER QUESTION:
 {question}
-
-Answer clearly and practically using the learner state as the source of truth.
 """
 
-        response = groq_client.chat.completions.create(
-            model=QA_MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are EduPath's Learning Companion. "
-                        "Do not invent scores, skills, achievements or resources."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            compound_custom={
-                "tools": {
-                    "enabled_tools": ["web_search"]
-                }
-            },
-            max_tokens=900,
+        return await run_adk_agent(
+            qa_agent,
+            prompt,
+            output_key=None,
+            user_prefix="qa",
         )
 
-        return response.choices[0].message.content or "No answer returned."
-
-    except Exception as e:
-        text = str(e).lower()
-
-        if "rate limit" in text or "tokens per minute" in text:
-            return (
-                "⏳ **Groq rate limit reached.** Please wait a few seconds and try again."
-            )
-
+    except Exception as exc:
         return (
             f"❌ **EduPath could not answer**\n\n"
-            f"`{type(e).__name__}: {e}`"
+            f"`{type(exc).__name__}: {exc}`"
         )
 
 
 # ============================================================
-# VISUAL DESIGN
+# UI
 # ============================================================
 
 CUSTOM_CSS = r"""
 :root {
-    --ep-bg: #f5f7fb;
-    --ep-panel: #ffffff;
-    --ep-border: #dce4ee;
-    --ep-text: #162033;
-    --ep-muted: #62718a;
-    --ep-purple: #6046d8;
-    --ep-purple-dark: #4c35b6;
-    --ep-teal: #0a8a7b;
-    --ep-blue: #2f6bc7;
-    --ep-green: #117852;
-    --ep-red: #b83a5a;
+    --bg: #f5f7fb;
+    --panel: #ffffff;
+    --border: #dbe3ee;
+    --text: #172033;
+    --muted: #607089;
+    --purple: #5b43d6;
+    --purple-dark: #4630b0;
+    --teal: #087f72;
+    --red: #b5345b;
 }
 
 body,
 .gradio-container {
     background:
-        radial-gradient(circle at 92% 0%, rgba(96,70,216,.08), transparent 22%),
-        linear-gradient(180deg, #ffffff 0%, var(--ep-bg) 100%) !important;
-    color: var(--ep-text) !important;
+        radial-gradient(circle at 95% 0%, rgba(91,67,214,.07), transparent 22%),
+        linear-gradient(180deg, #ffffff 0%, var(--bg) 100%) !important;
+    color: var(--text) !important;
 }
 
 .gradio-container {
-    max-width: 1320px !important;
+    max-width: 1280px !important;
 }
 
 .ep-header {
-    padding: 20px 4px 12px;
+    padding: 20px 4px 10px;
 }
 
 .ep-brand {
     font-size: 36px;
-    line-height: 1.05;
     font-weight: 850;
-    letter-spacing: -.04em;
-    color: #141b2b !important;
+    letter-spacing: -.045em;
+    color: #111827;
 }
 
-.ep-brand-sub {
-    color: #64748b !important;
+.ep-sub {
+    color: var(--muted);
     font-size: 14px;
     font-weight: 650;
     margin-left: 9px;
 }
 
 .ep-tagline {
-    color: #53627a !important;
-    margin-top: 8px;
+    color: #526179;
+    margin-top: 7px;
     font-size: 14px;
 }
 
-.ep-status {
+.ep-pill {
     display: inline-block;
-    margin-top: 13px;
+    margin-top: 12px;
     padding: 6px 11px;
-    background: #e8f9f5;
-    border: 1px solid #bde9df;
-    color: #08766a !important;
     border-radius: 999px;
+    color: var(--teal);
+    background: #eaf9f6;
+    border: 1px solid #c1ebe3;
     font-size: 11px;
     font-weight: 800;
-    letter-spacing: .05em;
+    letter-spacing: .04em;
 }
 
 .ep-card {
-    background: rgba(255,255,255,.98) !important;
-    border: 1px solid var(--ep-border) !important;
+    background: #ffffff !important;
+    border: 1px solid var(--border) !important;
     border-radius: 18px !important;
-    padding: 20px !important;
-    box-shadow: 0 10px 28px rgba(30,46,78,.07) !important;
+    padding: 18px !important;
+    box-shadow: 0 8px 24px rgba(26,43,73,.06) !important;
+}
+
+.ep-note {
+    background: #f8fafc !important;
+    border: 1px solid #e3e8ef !important;
+    border-radius: 12px !important;
+    color: #56657a !important;
+    padding: 12px !important;
 }
 
 button {
@@ -1417,45 +1540,50 @@ button {
 }
 
 button.primary {
-    background: linear-gradient(135deg, var(--ep-purple), var(--ep-purple-dark)) !important;
-    color: #fff !important;
+    background: linear-gradient(135deg, var(--purple), var(--purple-dark)) !important;
+    color: white !important;
     border: 0 !important;
-    box-shadow: 0 7px 18px rgba(96,70,216,.18) !important;
+    box-shadow: 0 7px 18px rgba(91,67,214,.20) !important;
+}
+
+button.primary:hover {
+    filter: brightness(1.05);
+    transform: translateY(-1px);
 }
 
 textarea,
 input,
 select {
-    background: #fff !important;
+    background: #ffffff !important;
+    color: var(--text) !important;
     border-color: #c8d3e1 !important;
-    color: var(--ep-text) !important;
 }
 
 textarea:focus,
 input:focus,
 select:focus {
-    border-color: var(--ep-purple) !important;
-    box-shadow: 0 0 0 2px rgba(96,70,216,.11) !important;
+    border-color: var(--purple) !important;
+    box-shadow: 0 0 0 2px rgba(91,67,214,.10) !important;
 }
 
 label,
 label span {
-    color: #334155 !important;
+    color: #344054 !important;
 }
 
 .tab-nav button {
-    color: #64748b !important;
+    color: #67768d !important;
     font-weight: 750 !important;
 }
 
 .tab-nav button.selected {
-    color: #3c2ca7 !important;
-    border-bottom-color: var(--ep-purple) !important;
+    color: #3e2cad !important;
+    border-bottom-color: var(--purple) !important;
 }
 
 .prose,
 .markdown-body {
-    color: var(--ep-text) !important;
+    color: var(--text) !important;
 }
 
 footer {
@@ -1463,18 +1591,13 @@ footer {
 }
 
 .ep-footer {
-    color: #8390a5 !important;
+    color: #8793a6 !important;
     font-size: 11px;
     text-align: center;
-    padding: 20px 0 6px;
+    padding: 18px 0 6px;
 }
 """
 
-
-
-# ============================================================
-# FINAL APP
-# ============================================================
 
 with gr.Blocks(
     title="EduPath — Adaptive Learning Companion",
@@ -1485,11 +1608,14 @@ with gr.Blocks(
     gr.HTML(
         """
         <div class="ep-header">
-            <div class="ep-brand">🎓 EduPath <span class="ep-brand-sub">Adaptive Learning Companion</span></div>
-            <div class="ep-tagline">
-                Build a learning path around what you know, what you need, and how you actually perform.
+            <div class="ep-brand">
+                🎓 EduPath
+                <span class="ep-sub">Adaptive Learning Companion</span>
             </div>
-            <div class="ep-status">● LIVE ADAPTIVE JOURNEY</div>
+            <div class="ep-tagline">
+                A learning path that changes when your evidence changes.
+            </div>
+            <div class="ep-pill">● LIVE ADAPTIVE JOURNEY · HYBRID AI</div>
         </div>
         """
     )
@@ -1497,7 +1623,7 @@ with gr.Blocks(
     with gr.Tabs():
 
         # ----------------------------------------------------
-        # OVERVIEW
+        # PROFILE
         # ----------------------------------------------------
 
         with gr.Tab("01 · Profile & Gaps"):
@@ -1506,7 +1632,7 @@ with gr.Blocks(
 
                 with gr.Column(
                     scale=1,
-                    elem_classes="ep-card"
+                    elem_classes="ep-card",
                 ):
 
                     gr.Markdown(
@@ -1516,7 +1642,7 @@ with gr.Blocks(
                     target_role = gr.Dropdown(
                         choices=list(ROLE_SKILLS.keys()),
                         value="AI-enabled EV Controls Engineer",
-                        label="Target Role",
+                        label="Target role",
                     )
 
                     with gr.Row():
@@ -1534,17 +1660,17 @@ with gr.Blocks(
                             minimum=1,
                             maximum=40,
                             step=1,
-                            label="Hours / week",
+                            label="Learning hours / week",
                         )
 
                     learner_background = gr.Textbox(
                         label="Background, skills, projects & goals",
                         value=(
                             "I am a power electronics engineer with 4 years of "
-                            "automotive and EV experience. I work with PMSM, FOC, "
-                            "SVPWM, MATLAB and Simulink. I have some Python experience "
-                            "and basic ML knowledge. I am learning LLMs, Agentic AI "
-                            "and MCP, and want to combine AI with EV controls."
+                            "automotive/EV experience. I work with PMSM, FOC, "
+                            "SVPWM, MATLAB and Simulink. I have some Python "
+                            "experience and basic machine-learning knowledge. "
+                            "I am learning LLMs, Agentic AI and MCP."
                         ),
                         lines=9,
                     )
@@ -1562,7 +1688,7 @@ with gr.Blocks(
 
                 with gr.Column(
                     scale=1,
-                    elem_classes="ep-card"
+                    elem_classes="ep-card",
                 ):
 
                     gr.Markdown(
@@ -1570,15 +1696,14 @@ with gr.Blocks(
                     )
 
                     profile_output = gr.Markdown(
-                        value=(
-                            "Enter your background and click **Analyze My Profile** "
-                            "to generate your learner profile."
-                        )
+                        value="Your learner profile will appear here."
                     )
 
                     gr.Markdown("### 🎯 Skill Gap Map")
 
-                    gap_output = gr.Markdown()
+                    gap_output = gr.Markdown(
+                        value="Your personalized gaps will appear here."
+                    )
 
             analyze_button.click(
                 fn=ui_analyze_profile,
@@ -1603,22 +1728,24 @@ with gr.Blocks(
 
         with gr.Tab("02 · Learning Plan"):
 
-            gr.Markdown(
-                """
-### 📚 Personalized Learning Plan
+            with gr.Column(
+                elem_classes="ep-card"
+            ):
 
-EduPath uses your current skills and remaining gaps to build the next four weeks of learning.
-"""
-            )
+                gr.Markdown(
+                    "### 📚 Your personalized learning path"
+                )
 
-            plan_button = gr.Button(
-                "✨ Generate My Learning Plan",
-                variant="primary",
-            )
+                gr.Markdown(
+                    "Start with **Profile & Gaps**, then generate the plan."
+                )
 
-            plan_output = gr.Markdown(
-                value="Analyze your profile first."
-            )
+                plan_button = gr.Button(
+                    "✨ Generate My Learning Plan",
+                    variant="primary",
+                )
+
+                plan_output = gr.Markdown()
 
             plan_button.click(
                 fn=ui_generate_plan,
@@ -1632,40 +1759,51 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
 
         with gr.Tab("03 · Practice & Assessment"):
 
-            practice_button = gr.Button(
-                "🛠️ Generate Practice Task",
-                variant="primary",
-            )
+            with gr.Column(
+                elem_classes="ep-card"
+            ):
 
-            practice_output = gr.Markdown(
-                value="Generate a plan first, then create a practice task."
-            )
+                practice_button = gr.Button(
+                    "🛠️ Generate Practice Task",
+                    variant="primary",
+                )
+
+                practice_output = gr.Markdown()
+
+                gr.Markdown("### ✍️ Submit your work")
+
+                learner_submission = gr.Textbox(
+                    label="Your answer / work",
+                    placeholder=(
+                        "Paste your explanation, code summary, "
+                        "results or reflection..."
+                    ),
+                    lines=9,
+                )
+
+                assess_button = gr.Button(
+                    "🧠 Assess & Adapt My Journey",
+                    variant="primary",
+                )
+
+                assessment_output = gr.Markdown()
+                adaptation_output = gr.Markdown()
+                updated_gap_output = gr.Markdown()
+
+                replan_button = gr.Button(
+                    "🔄 Generate Updated Plan"
+                )
+
+                replan_output = gr.Markdown()
 
             practice_button.click(
                 fn=ui_generate_practice,
                 inputs=[ui_state],
-                outputs=[practice_output, ui_state],
+                outputs=[
+                    practice_output,
+                    ui_state,
+                ],
             )
-
-            gr.Markdown("### ✍️ Submit your work")
-
-            learner_submission = gr.Textbox(
-                label="Your answer / work",
-                placeholder=(
-                    "Paste your explanation, solution, code summary, "
-                    "results or reflection here..."
-                ),
-                lines=10,
-            )
-
-            assess_button = gr.Button(
-                "📝 Assess & Adapt My Journey",
-                variant="primary",
-            )
-
-            assessment_output = gr.Markdown()
-            adaptation_output = gr.Markdown()
-            updated_gap_output = gr.Markdown()
 
             assess_button.click(
                 fn=ui_assess_and_adapt,
@@ -1681,16 +1819,13 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
                 ],
             )
 
-            replan_button = gr.Button(
-                "🔄 Generate Updated Plan"
-            )
-
-            replan_output = gr.Markdown()
-
             replan_button.click(
                 fn=ui_replan,
                 inputs=[ui_state],
-                outputs=[replan_output, ui_state],
+                outputs=[
+                    replan_output,
+                    ui_state,
+                ],
             )
 
         # ----------------------------------------------------
@@ -1702,12 +1837,11 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
             with gr.Row():
 
                 with gr.Column(
-                    scale=1,
                     elem_classes="ep-card"
                 ):
 
                     gr.Markdown(
-                        "### 🔎 Research your current priority gap"
+                        "### 🔎 Research your priority gap"
                     )
 
                     research_button = gr.Button(
@@ -1715,23 +1849,14 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
                         variant="primary",
                     )
 
-                    resources_output = gr.Markdown(
-                        value="Your top remaining gap will be researched here."
-                    )
-
-                    research_button.click(
-                        fn=ui_research_resources,
-                        inputs=[ui_state],
-                        outputs=[resources_output, ui_state],
-                    )
+                    resources_output = gr.Markdown()
 
                 with gr.Column(
-                    scale=1,
                     elem_classes="ep-card"
                 ):
 
                     gr.Markdown(
-                        "### 📈 See how your journey is evolving"
+                        "### 📈 See your journey evolving"
                     )
 
                     progress_button = gr.Button(
@@ -1739,15 +1864,25 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
                         variant="primary",
                     )
 
-                    progress_output = gr.Markdown(
-                        value="Complete at least one assessment to generate a richer report."
-                    )
+                    progress_output = gr.Markdown()
 
-                    progress_button.click(
-                        fn=ui_progress,
-                        inputs=[ui_state],
-                        outputs=[progress_output, ui_state],
-                    )
+            research_button.click(
+                fn=ui_research_resources,
+                inputs=[ui_state],
+                outputs=[
+                    resources_output,
+                    ui_state,
+                ],
+            )
+
+            progress_button.click(
+                fn=ui_progress,
+                inputs=[ui_state],
+                outputs=[
+                    progress_output,
+                    ui_state,
+                ],
+            )
 
         # ----------------------------------------------------
         # ASK
@@ -1755,29 +1890,29 @@ EduPath uses your current skills and remaining gaps to build the next four weeks
 
         with gr.Tab("05 · Ask EduPath"):
 
-            gr.Markdown(
-                """
-### 💬 Your learning companion
+            with gr.Column(
+                elem_classes="ep-card"
+            ):
 
-Ask why a topic appears in your path, what to focus on next, or how your recent assessment changed the journey.
-"""
-            )
+                gr.Markdown(
+                    "### 💬 Ask about your current learning journey"
+                )
 
-            question_input = gr.Textbox(
-                label="Your question",
-                placeholder=(
-                    "Why is Control Systems my biggest gap? "
-                    "What should I focus on next?"
-                ),
-                lines=4,
-            )
+                question_input = gr.Textbox(
+                    label="Your question",
+                    placeholder=(
+                        "Why is Control Systems my biggest gap? "
+                        "What should I focus on next?"
+                    ),
+                    lines=4,
+                )
 
-            ask_button = gr.Button(
-                "💬 Ask EduPath",
-                variant="primary",
-            )
+                ask_button = gr.Button(
+                    "💬 Ask EduPath",
+                    variant="primary",
+                )
 
-            answer_output = gr.Markdown()
+                answer_output = gr.Markdown()
 
             ask_button.click(
                 fn=ui_ask_edupath,
@@ -1785,13 +1920,15 @@ Ask why a topic appears in your path, what to focus on next, or how your recent 
                     question_input,
                     ui_state,
                 ],
-                outputs=[answer_output],
+                outputs=[
+                    answer_output,
+                ],
             )
 
     gr.HTML(
         """
         <div class="ep-footer">
-            EduPath · Adaptive Learning Prototype · Google ADK + Groq
+            EduPath · Google ADK + Qwen 3.8 27B + GPT-OSS 120B + web search
         </div>
         """
     )

@@ -5,86 +5,58 @@ colorFrom: indigo
 colorTo: blue
 sdk: gradio
 app_file: app.py
-python_version: "3.10"
 ---
 
 # 🎓 EduPath — Adaptive Learning Companion
 
 EduPath is an agentic AI learning and skill-gap application.
 
+## Hybrid two-LLM architecture
+
+EduPath deliberately routes work between two Groq-hosted models:
+
+- **Qwen 3.8 27B** — default model for learner profiling, planning, practice generation, resource curation, progress reports and learner Q&A.
+- **GPT-OSS 120B** — reserved for the deepest step: learner-work assessment. If the 120B call is rate-limited, the assessment falls back to Qwen 3.8 27B.
+
+This reduces repeated use of the 120B rate-limit bucket while still demonstrating two-model routing.
+
+## Research
+
+The app uses the `ddgs` Python package for web search, then the Qwen 3.8 27B Resource Curator converts the search evidence into structured learning resources. No third LLM is required.
+
 ## Core flow
 
-**Profile → Skill Gaps → Plan → Practice → Assessment → Adapt → Research → Progress → Ask**
-
-## Stack
-
-- Google ADK
-- Groq
-- LiteLLM
-- Gradio
-- Pydantic
-- pypdf
-
-## Run locally
-
-```bash
-pip install -r requirements.txt
-set GROQ_API_KEY=YOUR_KEY
-python app.py
-```
-
-On Linux/macOS:
-
-```bash
-export GROQ_API_KEY=YOUR_KEY
-python app.py
-```
+Profile → Skill Gaps → Plan → Practice → Assessment → Mastery Update → Replan → Research → Progress → Ask.
 
 ## Render deployment
 
-Create a Render **Web Service** connected to this GitHub repository.
-
-Build Command:
+Build:
 
 ```text
 pip install -r requirements.txt
 ```
 
-Start Command:
+Start:
 
 ```text
 python app.py
 ```
 
-Plan:
-
-```text
-Free
-```
-
-Add the environment variable:
+Required secret:
 
 ```text
 GROQ_API_KEY
 ```
 
-Do not commit the API key to GitHub.
+Never commit the API key to GitHub.
 
-## Hugging Face
+## Environment variables
 
-Ordinary Gradio Spaces may require paid access depending on the account. This repository is intentionally deployment-neutral and works as a Python/Gradio web service on Render.
+```text
+FAST_MODEL_NAME=groq/qwen/qwen3.8-27b
+DEEP_MODEL_NAME=groq/openai/gpt-oss-120b
+```
 
-## Security
+## Important
 
-Keep `GROQ_API_KEY` only in the hosting provider's secret/environment-variable store.
-
-
-## Render port binding
-
-The app explicitly binds Gradio to `0.0.0.0` and the Render-provided `PORT`.
-SSR is disabled for the Render deployment to keep the server path simple.
-
-
-## Model strategy
-
-Structured ADK agents use GPT-OSS 120B. Live research and Q&A use Groq Compound Mini with built-in web search to reduce pressure on the structured-agent quota.
+Learner state is session-based for this hackathon prototype. It is not a permanent database or account system.

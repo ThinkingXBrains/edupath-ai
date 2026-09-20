@@ -1,30 +1,28 @@
-HACKATHON SUBMISSION CHECKLIST
+Hackathon submission
 
 Agent Access Link:
-Use the Render public URL:
-https://<service-name>.onrender.com
+Use the public Render URL:
+https://<your-service>.onrender.com
 
 Agent Credentials:
 Not required — public demo.
 
 Additional Materials:
 - GitHub repository
-- README.md
 - ARCHITECTURE.md
-- Optional architecture screenshot
-- Optional short demo video
+- MODEL_STRATEGY.md
+- optional demo video
 
 Recommended demo:
-1. Analyze profile
-2. Generate plan
-3. Generate practice
-4. Submit work
-5. Assess & adapt
-6. Replan
-7. Research resources
-8. Progress report
+1. Analyze Profile
+2. Generate Learning Plan
+3. Generate Practice
+4. Submit Work
+5. Assess & Adapt
+6. Generate Updated Plan
+7. Research Current Gap
+8. Generate Progress Report
 9. Ask EduPath
 
 Security:
-- Never commit GROQ_API_KEY.
-- Add GROQ_API_KEY in Render Environment Variables.
+Keep GROQ_API_KEY only in Render environment variables.

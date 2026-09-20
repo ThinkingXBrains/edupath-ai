@@ -11,7 +11,7 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: 3.13.5
-      - key: RESEARCH_MODEL_NAME
-        value: groq/compound-mini
-      - key: QA_MODEL_NAME
-        value: groq/compound-mini
+      - key: FAST_MODEL_NAME
+        value: groq/qwen/qwen3.8-27b
+      - key: DEEP_MODEL_NAME
+        value: groq/openai/gpt-oss-120b

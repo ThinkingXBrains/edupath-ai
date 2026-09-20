@@ -1,4 +1,4 @@
-Demo Persona
+Demo persona
 
 Target role:
 AI-enabled EV Controls Engineer
