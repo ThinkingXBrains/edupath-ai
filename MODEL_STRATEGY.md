@@ -1,39 +1,7 @@
-# EduPath — Final Assessment Architecture
+# EduPath Research Quality
 
-## Root cause of the previous failure
+Research no longer displays raw broad metasearch results. It uses narrow site-restricted queries against trusted educational domains, rejects excluded domains such as Wikipedia/Fandom, scores subject relevance, deduplicates, and returns up to four resources.
 
-The 120B assessment agent was asked to return a Pydantic/JSON-schema document
-with a tight completion cap. Groq rejected the generation when the response
-did not satisfy the structured schema.
+For Control Systems, a deterministic fallback uses current MIT OpenCourseWare, NPTEL, MathWorks, and Coursera resources if search is poor.
 
-## Final fix
-
-Assessment deliberately does NOT use structured JSON output.
-
-GPT-OSS 120B is still used twice:
-
-1. **Stage 1 — deep compact analysis**
-   - task + submission
-   - six short text lines
-   - max 120 completion tokens
-
-2. **Stage 2 — compact review**
-   - Stage 1 notes only
-   - five short text lines
-   - max 110 completion tokens
-
-Python parses these lines into `AssessmentResult`.
-
-If Stage 2 fails, Stage 1 is already a complete assessment and is used directly.
-No third LLM call is made.
-
-## Deterministic responsibilities
-
-Python owns:
-- skill normalization
-- mastery calculation
-- gap recalculation
-- final assessment schema construction
-- fallback behavior
-
-This removes JSON-schema validation from the fragile deep-assessment path.
+DDGS currently supports `text(query, region, safesearch, max_results, page, backend)` and returns `title`, `href`, and `body`. citeturn744424search4turn744424search8

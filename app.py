@@ -6,6 +6,7 @@ import time
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import gradio as gr
 from pydantic import BaseModel, Field
@@ -974,18 +975,182 @@ def format_assessment(result: AssessmentResult):
 
 
 def format_resources(items, skill):
-    out = f"## 🔎 Recommended Resources\n\n**Current focus:** {skill}\n"
+    out = f"## 🔎 Recommended Resources\n\n**Current focus:** {skill}\n\n"
 
     for i, item in enumerate(items, 1):
-        out += f"""
-### {i}. {item.get('title', 'Untitled')}
+        title = item.get("title", "Untitled")
+        source = item.get("source", item.get("domain", "Web"))
+        snippet = item.get("snippet", "").strip()
+        url = item.get("url", "")
 
-{item.get('snippet', '')}
+        out += f"### {i}. {title}\n\n"
+        out += f"**{source}**\n"
+        if snippet:
+            out += f"{snippet}\n"
+        if url:
+            out += f"🔗 {url}\n"
+        out += "\n"
 
-🔗 {item.get('url', '')}
-"""
+    return out.rstrip()
 
-    return out
+
+# ============================================================
+# RESEARCH QUALITY CONTROL
+# ============================================================
+
+RESEARCH_SOURCES = {
+    "Control Systems": ["ocw.mit.edu", "nptel.ac.in", "mathworks.com", "coursera.org"],
+    "FOC": ["mathworks.com", "ocw.mit.edu", "nptel.ac.in", "coursera.org"],
+    "PMSM": ["mathworks.com", "ocw.mit.edu", "nptel.ac.in", "coursera.org"],
+    "SVPWM": ["mathworks.com", "nptel.ac.in", "ocw.mit.edu"],
+    "MATLAB": ["mathworks.com", "ocw.mit.edu", "nptel.ac.in", "coursera.org"],
+    "Simulink": ["mathworks.com", "ocw.mit.edu", "coursera.org"],
+    "Power Electronics": ["ocw.mit.edu", "nptel.ac.in", "mathworks.com", "coursera.org"],
+    "Python": ["docs.python.org", "coursera.org", "edx.org", "kaggle.com"],
+    "Data Analysis": ["pandas.pydata.org", "coursera.org", "edx.org", "kaggle.com"],
+    "Machine Learning": ["scikit-learn.org", "deeplearning.ai", "coursera.org", "edx.org"],
+    "LLMs": ["huggingface.co", "learn.microsoft.com", "developers.google.com", "coursera.org"],
+    "Agentic AI": ["learn.microsoft.com", "cloud.google.com", "huggingface.co", "coursera.org"],
+    "MCP": ["modelcontextprotocol.io", "learn.microsoft.com", "huggingface.co"],
+}
+
+RESEARCH_EXCLUDE_DOMAINS = {
+    "wikipedia.org", "fandom.com", "youtube.com", "facebook.com",
+    "instagram.com", "pinterest.com", "x.com", "twitter.com"
+}
+
+RESEARCH_FALLBACKS = {
+    "Control Systems": [
+        {
+            "title": "Feedback Control Systems — MIT OpenCourseWare",
+            "source": "MIT OpenCourseWare",
+            "url": "https://ocw.mit.edu/courses/16-30-feedback-control-systems-fall-2010/",
+            "snippet": "State-space control design, classical analysis, robustness, linearization, and implementation issues.",
+        },
+        {
+            "title": "Control Systems — NPTEL",
+            "source": "NPTEL",
+            "url": "https://onlinecourses-archive.nptel.ac.in/noc18_ee41/preview",
+            "snippet": "Control-system fundamentals covering transfer functions, stability, system response, and PID design.",
+        },
+        {
+            "title": "Understanding Control Systems",
+            "source": "MathWorks",
+            "url": "https://www.mathworks.com/videos/series/understanding-control-systems-123420.html",
+            "snippet": "Introductory feedback and control-system concepts from MathWorks.",
+        },
+        {
+            "title": "Control Systems Courses",
+            "source": "Coursera",
+            "url": "https://www.coursera.org/courses?query=control%20systems",
+            "snippet": "Current control-systems learning options covering dynamics, feedback, PID, and state space.",
+        },
+    ]
+}
+
+
+def _research_domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _research_allowed_domain(url: str, allowed_domains: list[str]) -> bool:
+    domain = _research_domain(url)
+    if not domain:
+        return False
+    if any(domain == blocked or domain.endswith("." + blocked) for blocked in RESEARCH_EXCLUDE_DOMAINS):
+        return False
+    return any(domain == allowed or domain.endswith("." + allowed) for allowed in allowed_domains)
+
+
+def _research_relevance_score(title: str, snippet: str, skill: str, domain: str) -> int:
+    text = f"{title} {snippet}".lower()
+    score = 0
+    for term in [t for t in re.split(r"[^a-z0-9]+", skill.lower()) if len(t) >= 3]:
+        if term in text:
+            score += 3
+    for term in ["course", "tutorial", "lecture", "documentation", "engineering", "learning", "training", "notes", "control"]:
+        if term in text:
+            score += 1
+    preferred = {
+        "ocw.mit.edu": 10, "nptel.ac.in": 9, "mathworks.com": 9,
+        "docs.python.org": 10, "pandas.pydata.org": 10, "scikit-learn.org": 10,
+        "modelcontextprotocol.io": 10, "learn.microsoft.com": 9, "cloud.google.com": 9,
+        "huggingface.co": 8, "deeplearning.ai": 8, "coursera.org": 7,
+        "edx.org": 7, "kaggle.com": 6,
+    }
+    return score + preferred.get(domain, 0)
+
+
+def _rank_research_results(results: list[dict], skill: str, allowed_domains: list[str], limit: int = 4) -> list[dict]:
+    ranked=[]
+    seen=set()
+    subject_terms=[t for t in re.split(r"[^a-z0-9]+", skill.lower()) if len(t)>=3]
+    for item in results:
+        url=item.get("href", "")
+        title=item.get("title", "").strip()
+        snippet=item.get("body", "").strip()
+        if not url or not title or url in seen:
+            continue
+        if not _research_allowed_domain(url, allowed_domains):
+            continue
+        domain=_research_domain(url)
+        text=f"{title} {snippet}".lower()
+        if not any(term in text for term in subject_terms):
+            continue
+        ranked.append({
+            "title": title,
+            "url": url,
+            "snippet": snippet[:450],
+            "domain": domain,
+            "source": domain,
+            "score": _research_relevance_score(title, snippet, skill, domain),
+        })
+        seen.add(url)
+    ranked.sort(key=lambda x:x["score"], reverse=True)
+    return ranked[:limit]
+
+
+async def search_quality_resources(skill: str, target_role: str) -> list[dict]:
+    allowed=RESEARCH_SOURCES.get(
+        skill,
+        ["ocw.mit.edu", "nptel.ac.in", "mathworks.com", "coursera.org"],
+    )
+    from ddgs import DDGS
+
+    async def one_domain(domain: str):
+        query=f'"{skill}" tutorial course site:{domain}'
+        try:
+            return await asyncio.to_thread(
+                lambda: list(
+                    DDGS().text(
+                        query,
+                        max_results=3,
+                        region="us-en",
+                        safesearch="moderate",
+                        backend="auto",
+                    )
+                )
+            )
+        except Exception:
+            return []
+
+    batches=await asyncio.gather(
+        *[one_domain(domain) for domain in allowed[:4]]
+    )
+
+    combined=[item for batch in batches for item in batch]
+    ranked=_rank_research_results(
+        combined, skill, allowed, limit=4
+    )
+
+    if ranked:
+        return ranked
+
+    return RESEARCH_FALLBACKS.get(skill, [])
 
 
 # ============================================================
@@ -1599,61 +1764,33 @@ async def ui_research_resources(ui_state):
         if not ui_state:
             return "⚠️ Analyze your profile first.", ui_state
 
-        if not ui_state.get("gaps"):
+        gaps = ui_state.get("gaps", [])
+        if not gaps:
             return "No remaining gaps.", ui_state
 
-        priority = ui_state["gaps"][0]
-        query = (
-            f'{priority["skill"]} tutorial course '
-            f'documentation {ui_state["target_role"]}'
+        skill = gaps[0]["skill"]
+
+        resources = await search_quality_resources(
+            skill,
+            ui_state["target_role"],
         )
 
-        # Lazy import: does not affect Render startup.
-        from ddgs import DDGS
-
-        results = await asyncio.to_thread(
-            lambda: list(
-                DDGS().text(
-                    query,
-                    max_results=5,
-                )
+        if not resources:
+            return (
+                f"⚠️ No high-quality learning resources found for **{skill}** right now.",
+                ui_state,
             )
-        )
 
-        clean = []
-
-        for item in results:
-            url = item.get("href", "")
-            if not url:
-                continue
-
-            clean.append({
-                "title": item.get(
-                    "title",
-                    "Untitled",
-                ),
-                "url": url,
-                "snippet": item.get(
-                    "body",
-                    "",
-                )[:450],
-            })
-
-        if not clean:
-            return "⚠️ No web results returned. Try again.", ui_state
+        ui_state["recommended_resources"] = resources
 
         return (
-            format_resources(
-                clean,
-                priority["skill"],
-            ),
+            format_resources(resources, skill),
             ui_state,
         )
 
     except Exception as exc:
         return (
-            f"❌ **Research failed**\n\n"
-            f"`{type(exc).__name__}: {exc}`",
+            f"❌ **Research failed**\n\n`{type(exc).__name__}: {exc}`",
             ui_state,
         )
 
