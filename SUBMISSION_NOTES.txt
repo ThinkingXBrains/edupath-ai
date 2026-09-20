@@ -1,11 +1,17 @@
-Render:
-Build = pip install -r requirements.txt
-Start = python app.py
-Secret = GROQ_API_KEY
+Render
+------
+Build: pip install -r requirements.txt
+Start: python app.py
+Secret: GROQ_API_KEY
 
-Demo:
-Analyze → Plan → Practice → Submit → Assess & Adapt → Replan → Research → Progress → Ask
-
-Two models:
-Qwen 3.8 27B = routine learner tasks
-GPT-OSS 120B = compact deep assessment
+Demo
+----
+1. Analyze Profile
+2. Generate Plan
+3. Generate Practice
+4. Submit Work
+5. Assess & Adapt
+6. Generate Updated Plan
+7. Research
+8. Progress
+9. Ask EduPath

@@ -1,42 +1,15 @@
-# EduPath — Final Two-LLM + Canonical Skill Strategy
+# Final model strategy
 
-## Two LLMs
+The application deliberately separates inference from deterministic state.
 
-**Qwen 3.8 27B**
-- compact learner profile extraction
-- learning plan
-- practice task
-- learner Q&A
+Qwen 3.8 27B is the high-frequency workhorse. GPT-OSS 120B is reserved for the
+highest-value deep assessment and is used in two compact stages. The second
+stage receives only the compact first-stage notes, not the full learner
+submission.
 
-**GPT-OSS 120B**
-- deep assessment, split into two compact stages
+The profile schema is intentionally small. Role, experience and weekly hours
+come from the UI; the model only returns goals and evidence-backed skills.
 
-## Critical profile fix
-
-The UI already owns target role, experience years and weekly hours.
-The profile LLM therefore returns only goals and skills.
-
-A deterministic Python canonicalization layer then converts model labels into
-the internal skill vocabulary.
-
-Examples:
-
-- `MATLAB & Simulink` → `MATLAB`, `Simulink`
-- `Python & Basic ML` → `Python`, `Machine Learning`
-- `LLMs & Agentic AI` → `LLMs`, `Agentic AI`
-- `Field-Oriented Control (FOC)` → `FOC`
-
-This prevents valid learner evidence from being lost because the LLM used a
-different spelling or combined two related skills.
-
-The system does NOT automatically map generic `motor control` to `Control Systems`,
-because that would create unsupported evidence.
-
-## Deterministic ownership
-
-Python owns:
-- UI-authoritative learner fields
-- skill canonicalization
-- gap calculation
-- mastery updates
-- progress calculation
+The application uses a client-side rolling output reservation to avoid bursts
+against the current account's output-token allowance. This does not circumvent
+provider limits.

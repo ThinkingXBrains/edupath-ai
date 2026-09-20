@@ -1,75 +1,38 @@
-# EduPath Architecture
+# EduPath architecture
 
 ```text
-                       ┌───────────────────┐
-                       │      Learner      │
-                       └─────────┬─────────┘
-                                 │
-                                 ▼
-                      ┌─────────────────────┐
-                      │    Profile Agent    │
-                      │  Qwen 3.8 27B       │
-                      └─────────┬───────────┘
-                                │
-                                ▼
-                       Deterministic Gap Engine
-                                │
-                                ▼
-                      ┌─────────────────────┐
-                      │    Planner Agent    │
-                      │  Qwen 3.8 27B       │
-                      └─────────┬───────────┘
-                                │
-                                ▼
-                      ┌─────────────────────┐
-                      │   Practice Agent    │
-                      │  Qwen 3.8 27B       │
-                      └─────────┬───────────┘
-                                │
-                                ▼
-                         Learner Submission
-                                │
-                                ▼
-                      ┌─────────────────────┐
-                      │ Deep Assessment     │
-                      │ GPT-OSS 120B        │
-                      └─────────┬───────────┘
-                                │
-                       rate-limit fallback
-                                │
-                         ┌──────▼──────┐
-                         │ Qwen 27B    │
-                         └──────┬──────┘
-                                │
-                                ▼
-                        Deterministic Mastery
-                           + Gap Update
-                                │
-                                ▼
-                            Re-planner
-                                │
-                  ┌─────────────┼─────────────┐
-                  ▼             ▼             ▼
-             Web Search     Progress        Q&A
-               (DDGS)      Qwen 27B      Qwen 27B
-                  │
-                  ▼
-            Resource Curator
-              Qwen 27B
+Learner
+  ↓
+Profile Insights — Qwen 3.8 27B
+  ↓
+Python canonicalization
+  ↓
+Deterministic skill gaps
+  ↓
+Plan — Qwen 3.8 27B
+  ↓
+Practice — Qwen 3.8 27B
+  ↓
+Learner submission
+  ↓
+Deep notes — GPT-OSS 120B
+  ↓
+Compact notes
+  ↓
+Final assessment — GPT-OSS 120B
+  ↓
+Deterministic mastery update
+  ↓
+Gap recalculation
+  ↓
+Replan — Qwen 3.8 27B
+  ↓
+Research — DDGS
+  ↓
+Progress — Python
+  ↓
+Ask EduPath — Qwen 3.8 27B
 ```
 
-### Why two models?
-
-Use the compact Qwen model for high-frequency, structured and conversational tasks.
-
-Reserve GPT-OSS 120B for the highest-value deep assessment stage, with a Qwen fallback.
-
-### What is deterministic?
-
-- skill-name normalization
-- target-role skill levels
-- gap calculation
-- mastery update
-- state management
-
-The LLMs do not directly decide the numerical mastery update rule.
+The ADK/LiteLLM/model layer is imported lazily so Render can bind its web port
+before any model objects are constructed.
