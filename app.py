@@ -3,6 +3,7 @@ import json
 import uuid
 import asyncio
 import time
+import re
 from pathlib import Path
 from typing import Any
 
@@ -112,36 +113,47 @@ ROLE_SKILLS = {
 SKILL_ALIASES = {
     "power electronics engineering": "Power Electronics",
     "power electronics": "Power Electronics",
+
     "permanent magnet synchronous motors": "PMSM",
     "permanent magnet synchronous motor": "PMSM",
     "permanent magnet synchronous motors (pmsm)": "PMSM",
     "permanent magnet synchronous motor (pmsm)": "PMSM",
     "pmsm": "PMSM",
+
     "field oriented control": "FOC",
     "field-oriented control": "FOC",
     "field oriented control (foc)": "FOC",
     "field-oriented control (foc)": "FOC",
     "foc": "FOC",
+
     "space vector pwm": "SVPWM",
     "space vector pwm (svpwm)": "SVPWM",
     "svpwm": "SVPWM",
+
     "machine learning": "Machine Learning",
     "machine learning (basic)": "Machine Learning",
-    "ml": "Machine Learning",
+    "basic machine learning": "Machine Learning",
+
     "large language model": "LLMs",
     "large language models": "LLMs",
     "llm": "LLMs",
     "llms": "LLMs",
+
     "agentic ai": "Agentic AI",
-    "mcp": "MCP",
+
     "data analysis": "Data Analysis",
     "data analytics": "Data Analysis",
+
     "python": "Python",
     "python programming": "Python",
+
     "deep learning": "Deep Learning",
     "matlab": "MATLAB",
     "simulink": "Simulink",
+    "mcp": "MCP",
     "apis": "APIs",
+    "control systems": "Control Systems",
+    "control system": "Control Systems",
     "torque control": "Torque control",
     "regenerative braking": "Regenerative braking",
     "bldc": "BLDC",
@@ -150,42 +162,274 @@ SKILL_ALIASES = {
 }
 
 
+# Explicitly handle the compound labels that small LLMs
+# commonly produce when summarising related skills.
+COMPOUND_SKILL_EXPANSIONS = {
+    "matlab & simulink": ["MATLAB", "Simulink"],
+    "matlab and simulink": ["MATLAB", "Simulink"],
+    "python & basic ml": ["Python", "Machine Learning"],
+    "python and basic ml": ["Python", "Machine Learning"],
+    "python & machine learning": ["Python", "Machine Learning"],
+    "python and machine learning": ["Python", "Machine Learning"],
+    "llms & agentic ai": ["LLMs", "Agentic AI"],
+    "llms and agentic ai": ["LLMs", "Agentic AI"],
+    "llm & agentic ai": ["LLMs", "Agentic AI"],
+    "llm and agentic ai": ["LLMs", "Agentic AI"],
+    # Do NOT map "motor control" to Control Systems automatically:
+    # that would be an unsupported inference.
+    "power electronics & motor control": ["Power Electronics"],
+    "power electronics and motor control": ["Power Electronics"],
+}
+
+
+PHRASE_TO_SKILL = [
+    ("field-oriented control", "FOC"),
+    ("field oriented control", "FOC"),
+    ("space vector pwm", "SVPWM"),
+    ("permanent magnet synchronous motor", "PMSM"),
+    ("power electronics", "Power Electronics"),
+    ("regenerative braking", "Regenerative braking"),
+    ("machine learning", "Machine Learning"),
+    ("data analysis", "Data Analysis"),
+    ("agentic ai", "Agentic AI"),
+    ("deep learning", "Deep Learning"),
+    ("simulink", "Simulink"),
+    ("matlab", "MATLAB"),
+    ("python", "Python"),
+    ("llms", "LLMs"),
+    ("llm", "LLMs"),
+    ("mcp", "MCP"),
+    ("control systems", "Control Systems"),
+    ("control system", "Control Systems"),
+    ("pmsm", "PMSM"),
+    ("svpwm", "SVPWM"),
+    ("foc", "FOC"),
+    ("bldc", "BLDC"),
+    ("apis", "APIs"),
+]
+
+
+def _normalise_text(value: str) -> str:
+    return " ".join(
+        value.strip().lower().split()
+    )
+
+
 def normalize_skill_name(name: str) -> str:
-    key = " ".join(name.strip().lower().split())
-    return SKILL_ALIASES.get(key, name.strip())
+    key = _normalise_text(name)
+
+    return SKILL_ALIASES.get(
+        key,
+        name.strip(),
+    )
 
 
-def calculate_skill_gaps(profile, target_role: str):
-    target_skills = ROLE_SKILLS[target_role]
+def expand_skill_name(name: str) -> list[str]:
+    """
+    Convert one LLM label into one or more internal canonical skills.
+
+    This is intentionally deterministic. It prevents labels such as
+    'MATLAB & Simulink' from becoming a single unmatched skill key.
+    """
+
+    key = _normalise_text(name)
+
+    if key in COMPOUND_SKILL_EXPANSIONS:
+        return list(
+            COMPOUND_SKILL_EXPANSIONS[key]
+        )
+
+    exact = SKILL_ALIASES.get(key)
+
+    if exact:
+        return [exact]
+
+    found = []
+
+    for phrase, canonical in PHRASE_TO_SKILL:
+
+        if phrase in {
+            "foc",
+            "svpwm",
+            "pmsm",
+            "llm",
+            "llms",
+            "mcp",
+            "bldc",
+            "apis",
+        }:
+
+            if re.search(
+                rf"\\b{re.escape(phrase)}\\b",
+                key,
+            ):
+
+                if canonical not in found:
+                    found.append(canonical)
+
+        elif phrase in key:
+
+            if canonical not in found:
+                found.append(canonical)
+
+    return found or [name.strip()]
+
+
+def canonicalize_profile_skills(
+    skills: list[Skill],
+) -> list[Skill]:
+    """
+    Merge LLM labels into canonical skill records.
+
+    Example:
+      'MATLAB & Simulink' →
+          MATLAB + Simulink
+
+      'Python & Basic ML' →
+          Python + Machine Learning
+    """
+
+    merged: dict[str, dict[str, Any]] = {}
+
+    for skill in skills:
+
+        names = expand_skill_name(
+            skill.name
+        )
+
+        for canonical in names:
+
+            if canonical not in merged:
+
+                merged[canonical] = {
+                    "name": canonical,
+                    "proficiency": float(
+                        skill.proficiency
+                    ),
+                    "confidence": float(
+                        skill.confidence
+                    ),
+                    "evidence": list(
+                        skill.evidence
+                    ),
+                }
+
+            else:
+
+                record = merged[
+                    canonical
+                ]
+
+                record[
+                    "proficiency"
+                ] = max(
+                    record[
+                        "proficiency"
+                    ],
+                    float(
+                        skill.proficiency
+                    ),
+                )
+
+                record[
+                    "confidence"
+                ] = max(
+                    record[
+                        "confidence"
+                    ],
+                    float(
+                        skill.confidence
+                    ),
+                )
+
+                for evidence in skill.evidence:
+
+                    if evidence not in record[
+                        "evidence"
+                    ]:
+
+                        record[
+                            "evidence"
+                        ].append(
+                            evidence
+                        )
+
+    return [
+        Skill.model_validate(
+            record
+        )
+        for record in merged.values()
+    ]
+
+
+def calculate_skill_gaps(
+    profile,
+    target_role: str,
+):
+    target_skills = ROLE_SKILLS[
+        target_role
+    ]
 
     current = {
-        normalize_skill_name(skill.name): skill
+        normalize_skill_name(
+            skill.name
+        ): skill
         for skill in profile.skills
     }
 
     gaps = []
 
     for skill_name, target in target_skills.items():
-        item = current.get(skill_name)
+
+        item = current.get(
+            skill_name
+        )
 
         if item:
-            mastery = float(item.proficiency)
-            confidence = float(item.confidence)
+
+            mastery = float(
+                item.proficiency
+            )
+
+            confidence = float(
+                item.confidence
+            )
+
         else:
+
             mastery = 0.0
             confidence = 0.0
 
         gaps.append(
             {
                 "skill": skill_name,
-                "current": round(mastery, 2),
-                "target": round(target, 2),
-                "gap": round(max(target - mastery, 0.0), 2),
-                "confidence": round(confidence, 2),
+                "current": round(
+                    mastery,
+                    2,
+                ),
+                "target": round(
+                    target,
+                    2,
+                ),
+                "gap": round(
+                    max(
+                        target - mastery,
+                        0.0,
+                    ),
+                    2,
+                ),
+                "confidence": round(
+                    confidence,
+                    2,
+                ),
             }
         )
 
-    gaps.sort(key=lambda x: x["gap"], reverse=True)
+    gaps.sort(
+        key=lambda x: x["gap"],
+        reverse=True,
+    )
+
     return gaps
 
 
@@ -303,25 +547,36 @@ profile_agent = LlmAgent(
     model=fast_model(),
     description="Extracts compact learner insights.",
     instruction="""
-Extract ONLY the learner's goals and evidence-backed skills.
+Extract ONLY learner goals and evidence-backed skills.
 
 The UI already supplies:
 - target role
 - experience years
 - weekly learning hours
 
-Do NOT generate those fields.
+DO NOT output those fields.
 
-Limits:
-- maximum 6 skills
+Use these canonical skill names whenever applicable:
+Control Systems, FOC, PMSM, SVPWM, MATLAB, Simulink,
+Power Electronics, Python, Data Analysis, Machine Learning,
+LLMs, Agentic AI, MCP, Deep Learning, APIs,
+Regenerative Braking, BLDC, Torque control.
+
+Examples:
+- "field oriented control" -> "FOC"
+- "permanent magnet synchronous motor" -> "PMSM"
+- "MATLAB & Simulink" -> prefer two separate skills
+- "Python & Basic ML" -> prefer two separate skills
+- "LLMs & Agentic AI" -> prefer two separate skills
+
+Rules:
+- maximum 6 source skill labels
 - maximum 3 goals
-- evidence = one short sentence per skill
-- use simple skill names
-- no combined unrelated skills
-- no explanations
-- no invented evidence
-
-Return only the structured output.
+- one short evidence sentence per skill
+- do not invent skills
+- do not combine unrelated skills
+- no explanation
+- return only structured output
 """,
     output_schema=ProfileInsights,
     output_key="profile_insights",
@@ -330,6 +585,7 @@ Return only the structured output.
         max_output_tokens=320,
     ),
 )
+
 
 
 planner_agent = LlmAgent(
@@ -703,11 +959,21 @@ async def run_with_fallback(
 # FORMATTERS
 # ============================================================
 
-def format_profile(profile: LearnerProfile) -> str:
+def format_profile(
+    profile: LearnerProfile
+) -> str:
+
     goals = "\n".join(
         f"- {goal}"
         for goal in profile.goals
     ) or "- —"
+
+    detected = "\n".join(
+        f"- ✅ {skill.name} — "
+        f"{skill.proficiency:.0%} "
+        f"(confidence {skill.confidence:.0%})"
+        for skill in profile.skills
+    ) or "- No evidence-backed skills detected."
 
     return f"""
 ## 👤 Learner Profile
@@ -723,6 +989,9 @@ def format_profile(profile: LearnerProfile) -> str:
 
 ### Goals
 {goals}
+
+### Detected Skills
+{detected}
 """
 
 
@@ -991,8 +1260,8 @@ async def ui_analyze_profile(
                     errors="ignore",
                 )
 
-        # The model only infers goals + skills.
-        # Role/experience/hours come directly from the UI.
+        # The LLM only infers goals and skills.
+        # Role, experience and hours come directly from the UI.
         prompt = f"""
 LEARNER:
 {learner_background[:5000]}
@@ -1012,6 +1281,14 @@ RESUME:
             raw
         )
 
+        # Repair / canonicalize the model's skill labels
+        # before calculating any gaps.
+        canonical_skills = (
+            canonicalize_profile_skills(
+                insights.skills
+            )
+        )
+
         profile = LearnerProfile(
             target_role=target_role,
             experience_years=float(
@@ -1021,7 +1298,7 @@ RESUME:
             weekly_hours=float(
                 weekly_hours
             ),
-            skills=insights.skills,
+            skills=canonical_skills,
         )
 
         gaps = calculate_skill_gaps(
@@ -1040,9 +1317,9 @@ RESUME:
             skills[name] = {
                 "mastery": skill.proficiency,
                 "confidence": skill.confidence,
-                "evidence": [
+                "evidence": list(
                     skill.evidence
-                ],
+                ),
                 "assessment_scores": [],
             }
 
@@ -1077,6 +1354,8 @@ RESUME:
             "",
             ui_state,
         )
+
+
 
 
 async def ui_generate_plan(ui_state):
@@ -1156,7 +1435,7 @@ PRIORITY GAP:
 {json.dumps(priority, separators=(",", ":"))}
 
 CURRENT SKILLS:
-{json.dumps(ui_state["profile"]["skills"], indent=2)}
+{json.dumps(ui_state["profile"]["skills"][:8], separators=(",", ":"))}
 
 Create one practical hands-on task.
 """

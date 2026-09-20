@@ -1,40 +1,42 @@
-# EduPath — Token-Safe Two-LLM Strategy
+# EduPath — Final Two-LLM + Canonical Skill Strategy
 
-## The profile error
+## Two LLMs
 
-The previous profile schema required the model to generate target_role,
-experience_years and weekly_hours even though the UI already had those values.
-The completion was truncated before the required fields.
+**Qwen 3.8 27B**
+- compact learner profile extraction
+- learning plan
+- practice task
+- learner Q&A
 
-## Fix
+**GPT-OSS 120B**
+- deep assessment, split into two compact stages
 
-Qwen now returns only:
-- up to 3 goals
-- up to 6 evidence-backed skills
+## Critical profile fix
 
-Python supplies:
-- target role
-- experience years
-- weekly hours
+The UI already owns target role, experience years and weekly hours.
+The profile LLM therefore returns only goals and skills.
 
-and constructs the full LearnerProfile.
+A deterministic Python canonicalization layer then converts model labels into
+the internal skill vocabulary.
 
-## GPT-OSS 120B deep assessment
+Examples:
 
-Two compact stages:
+- `MATLAB & Simulink` → `MATLAB`, `Simulink`
+- `Python & Basic ML` → `Python`, `Machine Learning`
+- `LLMs & Agentic AI` → `LLMs`, `Agentic AI`
+- `Field-Oriented Control (FOC)` → `FOC`
 
-1. task + submission → compact AssessmentNotes
-2. AssessmentNotes only → final AssessmentResult
+This prevents valid learner evidence from being lost because the LLM used a
+different spelling or combined two related skills.
 
-Stage 2 never receives the original learner submission.
+The system does NOT automatically map generic `motor control` to `Control Systems`,
+because that would create unsupported evidence.
 
-## Token discipline
+## Deterministic ownership
 
-- explicit output-token caps
-- compact prompts
-- compact schemas
-- local rolling output-token reservation
-- research through DDGS
-- progress and mastery updates in Python
-
-This is token control, not a mechanism for bypassing Groq's provider limits.
+Python owns:
+- UI-authoritative learner fields
+- skill canonicalization
+- gap calculation
+- mastery updates
+- progress calculation
