@@ -33,6 +33,18 @@ DEEP_MODEL_NAME = os.getenv(
     "groq/openai/gpt-oss-120b",
 )
 
+# Conservative local rolling output-token reservations.
+# These values are below the 1K output-token/minute ceiling
+# shown in the user's current Groq error.
+FAST_OUTPUT_BUDGET_PER_MINUTE = 850
+DEEP_OUTPUT_BUDGET_PER_MINUTE = 700
+
+_fast_usage = []
+_deep_usage = []
+
+_fast_budget_lock = asyncio.Lock()
+_deep_budget_lock = asyncio.Lock()
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
