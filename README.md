@@ -83,3 +83,8 @@ Keep `GROQ_API_KEY` only in the hosting provider's secret/environment-variable s
 
 The app explicitly binds Gradio to `0.0.0.0` and the Render-provided `PORT`.
 SSR is disabled for the Render deployment to keep the server path simple.
+
+
+## Model strategy
+
+Structured ADK agents use GPT-OSS 120B. Live research and Q&A use Groq Compound Mini with built-in web search to reduce pressure on the structured-agent quota.

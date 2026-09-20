@@ -18,7 +18,23 @@ from google.genai import types
 # ============================================================
 
 APP_NAME = "edupath"
-MODEL_NAME = "groq/openai/gpt-oss-120b"
+
+# Structured agents: strict Pydantic output via ADK/LiteLLM.
+STRUCTURED_MODEL_NAME = os.getenv(
+    "STRUCTURED_MODEL_NAME",
+    "groq/openai/gpt-oss-120b",
+)
+
+# Web-heavy and conversational tasks: Groq Compound Mini.
+RESEARCH_MODEL_NAME = os.getenv(
+    "RESEARCH_MODEL_NAME",
+    "groq/compound-mini",
+)
+QA_MODEL_NAME = os.getenv(
+    "QA_MODEL_NAME",
+    "groq/compound-mini",
+)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
@@ -30,14 +46,17 @@ if not GROQ_API_KEY:
 def groq_model():
     """Shared ADK/LiteLLM model configuration."""
     return LiteLlm(
-        model=MODEL_NAME,
+        model=STRUCTURED_MODEL_NAME,
         api_key=GROQ_API_KEY,
         reasoning_effort="low",
         include_reasoning=False,
     )
 
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(
+    api_key=GROQ_API_KEY,
+    default_headers={"Groq-Model-Version": "latest"},
+)
 
 
 # ============================================================
@@ -416,6 +435,12 @@ Do not invent scores, skills, achievements or resources.
 # ============================================================
 
 async def run_adk_agent(agent, message_text, output_key=None, user_prefix="edupath"):
+    """
+    Run an ADK agent and retry once if Groq reports a retryable
+    token-rate-limit interval.
+    """
+    import asyncio
+
     user_id = f"{user_prefix}_{uuid.uuid4().hex[:8]}"
 
     runner = InMemoryRunner(
@@ -433,38 +458,55 @@ async def run_adk_agent(agent, message_text, output_key=None, user_prefix="edupa
         parts=[types.Part.from_text(text=message_text)],
     )
 
-    events = []
+    for attempt in range(2):
+        try:
+            events = []
 
-    async for event in runner.run_async(
-        user_id=user_id,
-        session_id=session.id,
-        new_message=message,
-    ):
-        events.append(event)
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=session.id,
+                new_message=message,
+            ):
+                events.append(event)
 
-    if output_key:
-        state = await runner.session_service.get_session(
-            app_name=APP_NAME,
-            user_id=user_id,
-            session_id=session.id,
-        )
+            if output_key:
+                state = await runner.session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=user_id,
+                    session_id=session.id,
+                )
 
-        result = state.state.get(output_key)
+                result = state.state.get(output_key)
 
-        if isinstance(result, str):
-            result = json.loads(result)
+                if isinstance(result, str):
+                    result = json.loads(result)
 
-        return result
+                return result
 
-    text = []
+            text_parts = []
 
-    for event in events:
-        if event.is_final_response() and event.content:
-            for part in event.content.parts:
-                if part.text:
-                    text.append(part.text)
+            for event in events:
+                if event.is_final_response() and event.content:
+                    for part in event.content.parts:
+                        if part.text:
+                            text_parts.append(part.text)
 
-    return "\n".join(text)
+            return "\n".join(text_parts)
+
+        except Exception as exc:
+            text = str(exc)
+            match = re.search(
+                r"try again in\s*([0-9]+(?:\.[0-9]+)?)s",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+            if attempt == 0 and match:
+                seconds = min(float(match.group(1)) + 0.5, 30.0)
+                await asyncio.sleep(seconds)
+                continue
+
+            raise
 
 
 # ============================================================
@@ -1072,67 +1114,55 @@ async def ui_research_resources(ui_state):
         if not ui_state:
             return "⚠️ Analyze your profile first.", ui_state
 
-        if not ui_state.get("gaps"):
+        gaps = ui_state.get("gaps", [])
+
+        if not gaps:
             return "No remaining gaps to research.", ui_state
 
-        priority = ui_state["gaps"][0]
+        priority = gaps[0]
 
         prompt = f"""
-You are EduPath's learning-resource researcher.
+Find four high-quality learning resources for this learner.
 
-Target role:
-{ui_state["target_role"]}
+Target role: {ui_state["target_role"]}
+Priority skill gap: {priority["skill"]}
+Current level: {priority["current"]}
+Target level: {priority["target"]}
 
-Priority skill:
-{priority["skill"]}
+For each resource provide:
+- Title
+- Provider
+- Full URL
+- Difficulty
+- Estimated hours
+- Free/Paid
+- Why relevant
 
-Current level:
-{priority["current"]}
-
-Target level:
-{priority["target"]}
-
-Find four high-quality learning resources.
-
-For every resource include:
-Title:
-Provider:
-URL:
-Difficulty:
-Estimated hours:
-Free/Paid:
-Why relevant:
-
-URL is mandatory.
-Use actual URLs.
-Do not invent URLs.
+Prefer official documentation, university material, and established platforms.
+Use actual URLs. Do not invent URLs. Keep the response concise.
 """
 
+        # Compound Mini performs the web search server-side.
         response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=RESEARCH_MODEL_NAME,
             messages=[
                 {
                     "role": "user",
                     "content": prompt,
                 }
             ],
-            tools=[
-                {
-                    "type": "browser_search"
+            compound_custom={
+                "tools": {
+                    "enabled_tools": ["web_search"]
                 }
-            ],
-            tool_choice="required",
-            reasoning_effort="low",
-            include_reasoning=False,
-            max_completion_tokens=1500,
+            },
+            max_tokens=1200,
         )
 
-        research_text = (
-            response.choices[0].message.content or ""
-        )
+        research_text = response.choices[0].message.content or ""
 
         urls = re.findall(
-            r'https?://[^\s\]\)\>,"]+',
+            r'https?://[^\s\]\)>,"]+',
             research_text,
         )
 
@@ -1143,15 +1173,16 @@ TARGET SKILL:
 TARGET ROLE:
 {ui_state["target_role"]}
 
-RESEARCH:
+RESEARCH RESULTS:
 {research_text}
 
 VERIFIED URLS:
 {json.dumps(urls, indent=2)}
 
-Select 3-4 resources.
-Use only the verified URLs above.
+Select 3-4 useful learning resources.
+Use ONLY URLs supplied above.
 Do not invent or alter URLs.
+Return only ResourceCollection.
 """
 
         raw_collection = await run_adk_agent(
@@ -1173,6 +1204,14 @@ Do not invent or alter URLs.
         return format_resources(collection), ui_state
 
     except Exception as e:
+        text = str(e).lower()
+
+        if "rate limit" in text or "tokens per minute" in text:
+            return (
+                "⏳ **Groq rate limit reached.** Please wait a few seconds and try again.",
+                ui_state,
+            )
+
         return (
             f"❌ **Research failed**\n\n`{type(e).__name__}: {e}`",
             ui_state,
@@ -1252,16 +1291,43 @@ CURRENT EDUPATH STATE:
 
 LEARNER QUESTION:
 {question}
+
+Answer clearly and practically using the learner state as the source of truth.
 """
 
-        return await run_adk_agent(
-            qa_agent,
-            prompt,
-            output_key=None,
-            user_prefix="qa",
+        response = groq_client.chat.completions.create(
+            model=QA_MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are EduPath's Learning Companion. "
+                        "Do not invent scores, skills, achievements or resources."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            compound_custom={
+                "tools": {
+                    "enabled_tools": ["web_search"]
+                }
+            },
+            max_tokens=900,
         )
 
+        return response.choices[0].message.content or "No answer returned."
+
     except Exception as e:
+        text = str(e).lower()
+
+        if "rate limit" in text or "tokens per minute" in text:
+            return (
+                "⏳ **Groq rate limit reached.** Please wait a few seconds and try again."
+            )
+
         return (
             f"❌ **EduPath could not answer**\n\n"
             f"`{type(e).__name__}: {e}`"
@@ -1274,135 +1340,122 @@ LEARNER QUESTION:
 
 CUSTOM_CSS = r"""
 :root {
-    --ep-bg: #0b1020;
-    --ep-panel: #121a2c;
-    --ep-panel-2: #18233a;
-    --ep-border: #263653;
-    --ep-text: #edf2ff;
-    --ep-muted: #99a8c2;
-    --ep-purple: #a177ff;
-    --ep-teal: #43dfc2;
-    --ep-blue: #6da7ff;
-    --ep-pink: #f478b2;
-    --ep-danger: #ff718d;
+    --ep-bg: #f5f7fb;
+    --ep-panel: #ffffff;
+    --ep-border: #dce4ee;
+    --ep-text: #162033;
+    --ep-muted: #62718a;
+    --ep-purple: #6046d8;
+    --ep-purple-dark: #4c35b6;
+    --ep-teal: #0a8a7b;
+    --ep-blue: #2f6bc7;
+    --ep-green: #117852;
+    --ep-red: #b83a5a;
 }
 
 body,
 .gradio-container {
     background:
-        radial-gradient(circle at 85% 5%, rgba(161,119,255,.17), transparent 25%),
-        radial-gradient(circle at 5% 92%, rgba(67,223,194,.10), transparent 26%),
-        var(--ep-bg) !important;
+        radial-gradient(circle at 92% 0%, rgba(96,70,216,.08), transparent 22%),
+        linear-gradient(180deg, #ffffff 0%, var(--ep-bg) 100%) !important;
     color: var(--ep-text) !important;
 }
 
 .gradio-container {
-    max-width: 1450px !important;
+    max-width: 1320px !important;
 }
 
 .ep-header {
-    padding: 24px 4px 18px;
+    padding: 20px 4px 12px;
 }
 
 .ep-brand {
     font-size: 36px;
-    font-weight: 800;
-    letter-spacing: -0.04em;
+    line-height: 1.05;
+    font-weight: 850;
+    letter-spacing: -.04em;
+    color: #141b2b !important;
 }
 
 .ep-brand-sub {
-    color: var(--ep-muted);
+    color: #64748b !important;
     font-size: 14px;
-    margin-left: 10px;
+    font-weight: 650;
+    margin-left: 9px;
 }
 
 .ep-tagline {
-    color: var(--ep-muted);
+    color: #53627a !important;
     margin-top: 8px;
-    font-size: 15px;
+    font-size: 14px;
 }
 
 .ep-status {
     display: inline-block;
-    margin-top: 16px;
-    border: 1px solid #2a554c;
-    background: rgba(17,42,37,.85);
-    color: var(--ep-teal);
+    margin-top: 13px;
+    padding: 6px 11px;
+    background: #e8f9f5;
+    border: 1px solid #bde9df;
+    color: #08766a !important;
     border-radius: 999px;
-    padding: 7px 12px;
-    font-size: 12px;
-    letter-spacing: .04em;
-}
-
-.ep-section-title {
-    margin: 10px 0 8px;
-    font-size: 20px;
-    font-weight: 750;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .05em;
 }
 
 .ep-card {
-    background: linear-gradient(145deg, rgba(18,26,44,.97), rgba(14,21,36,.97));
-    border: 1px solid var(--ep-border);
-    border-radius: 20px;
-    padding: 20px;
-    box-shadow: 0 14px 35px rgba(0,0,0,.18);
-}
-
-.ep-card-soft {
-    background: rgba(24,35,58,.72);
-    border: 1px solid var(--ep-border);
-    border-radius: 16px;
-    padding: 14px 16px;
-}
-
-.ep-metric {
-    font-size: 30px;
-    font-weight: 800;
-}
-
-.ep-muted {
-    color: var(--ep-muted);
-}
-
-.ep-small {
-    font-size: 12px;
-    color: var(--ep-muted);
-}
-
-button.primary {
-    background: linear-gradient(135deg, #a177ff, #7e68ee) !important;
-    border: 0 !important;
-    box-shadow: 0 8px 22px rgba(126,104,238,.22);
-}
-
-button.primary:hover {
-    filter: brightness(1.08);
-    transform: translateY(-1px);
+    background: rgba(255,255,255,.98) !important;
+    border: 1px solid var(--ep-border) !important;
+    border-radius: 18px !important;
+    padding: 20px !important;
+    box-shadow: 0 10px 28px rgba(30,46,78,.07) !important;
 }
 
 button {
-    border-radius: 12px !important;
+    border-radius: 11px !important;
+    font-weight: 700 !important;
+}
+
+button.primary {
+    background: linear-gradient(135deg, var(--ep-purple), var(--ep-purple-dark)) !important;
+    color: #fff !important;
+    border: 0 !important;
+    box-shadow: 0 7px 18px rgba(96,70,216,.18) !important;
 }
 
 textarea,
 input,
 select {
-    background: #0f1728 !important;
-    border-color: var(--ep-border) !important;
+    background: #fff !important;
+    border-color: #c8d3e1 !important;
     color: var(--ep-text) !important;
 }
 
-.tabs {
-    background: transparent !important;
+textarea:focus,
+input:focus,
+select:focus {
+    border-color: var(--ep-purple) !important;
+    box-shadow: 0 0 0 2px rgba(96,70,216,.11) !important;
+}
+
+label,
+label span {
+    color: #334155 !important;
 }
 
 .tab-nav button {
-    color: var(--ep-muted) !important;
+    color: #64748b !important;
+    font-weight: 750 !important;
 }
 
 .tab-nav button.selected {
-    color: var(--ep-text) !important;
+    color: #3c2ca7 !important;
     border-bottom-color: var(--ep-purple) !important;
+}
+
+.prose,
+.markdown-body {
+    color: var(--ep-text) !important;
 }
 
 footer {
@@ -1410,18 +1463,13 @@ footer {
 }
 
 .ep-footer {
-    color: var(--ep-muted);
+    color: #8390a5 !important;
     font-size: 11px;
     text-align: center;
-    padding: 22px 0 10px;
-}
-
-@media (max-width: 900px) {
-    .ep-brand {
-        font-size: 30px;
-    }
+    padding: 20px 0 6px;
 }
 """
+
 
 
 # ============================================================
@@ -1743,18 +1791,19 @@ Ask why a topic appears in your path, what to focus on next, or how your recent 
     gr.HTML(
         """
         <div class="ep-footer">
-            EduPath · Adaptive Learning Prototype · Powered by Google ADK + Groq
+            EduPath · Adaptive Learning Prototype · Google ADK + Groq
         </div>
         """
     )
 
 
 if __name__ == "__main__":
-    # Render provides PORT at runtime. Render requires the web server
-    # to listen on 0.0.0.0:$PORT.
     port = int(os.getenv("PORT", "10000"))
 
-    print(f"🚀 Starting EduPath on 0.0.0.0:{port}", flush=True)
+    print(
+        f"🚀 Starting EduPath on 0.0.0.0:{port}",
+        flush=True,
+    )
 
     demo.launch(
         server_name="0.0.0.0",
@@ -1762,6 +1811,6 @@ if __name__ == "__main__":
         share=False,
         show_error=True,
         ssr_mode=False,
-        theme=gr.themes.Base(),
+        theme=gr.themes.Soft(),
         css=CUSTOM_CSS,
     )
