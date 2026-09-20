@@ -1,0 +1,6 @@
+gradio==6.28.0
+google-adk==2.9.2
+litellm>=1.84
+groq
+pydantic
+pypdf
