@@ -1,21 +1,30 @@
-HACKATHON SUBMISSION NOTES
+HACKATHON SUBMISSION CHECKLIST
 
 Agent Access Link:
-Use the direct Hugging Face Space app URL:
-https://<space-subdomain>.hf.space
+Use the Render public URL:
+https://<service-name>.onrender.com
 
 Agent Credentials:
-Not required. The demo is intended to be public.
-Never provide the GROQ_API_KEY here.
+Not required — public demo.
 
 Additional Materials:
-- Public Hugging Face Space
-- README.md in the Space
+- GitHub repository
+- README.md
+- ARCHITECTURE.md
 - Optional architecture screenshot
-- Optional 2–3 minute demo video
+- Optional short demo video
 
-Recommended demo storyline:
-Profile → Gap → Plan → Practice → Assessment → Adapt → Research → Progress → Ask EduPath
+Recommended demo:
+1. Analyze profile
+2. Generate plan
+3. Generate practice
+4. Submit work
+5. Assess & adapt
+6. Replan
+7. Research resources
+8. Progress report
+9. Ask EduPath
 
 Security:
-Store GROQ_API_KEY only as a Hugging Face Space Secret.
+- Never commit GROQ_API_KEY.
+- Add GROQ_API_KEY in Render Environment Variables.

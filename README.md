@@ -4,7 +4,6 @@ emoji: 🎓
 colorFrom: indigo
 colorTo: blue
 sdk: gradio
-sdk_version: 6.28.0
 app_file: app.py
 python_version: "3.10"
 ---
@@ -13,58 +12,74 @@ python_version: "3.10"
 
 EduPath is an agentic AI learning and skill-gap application.
 
-It creates a personalized learning journey from a learner's current skills and target role, generates practice, assesses submitted work, updates mastery, recalculates gaps, replans the journey, researches learning resources, and produces progress reports.
-
 ## Core flow
 
-**Profile → Skill Gaps → Plan → Practice → Assessment → Adapt → Research → Progress**
+**Profile → Skill Gaps → Plan → Practice → Assessment → Adapt → Research → Progress → Ask**
 
 ## Stack
 
 - Google ADK
-- Groq hosted LLMs
+- Groq
 - LiteLLM
 - Gradio
 - Pydantic
-- Groq browser search for live resource research
+- pypdf
 
-## Hugging Face setup
+## Run locally
 
-1. Create a **Public Gradio Space**.
-2. Upload `app.py`, `requirements.txt`, and this `README.md`.
-3. Open **Settings → Secrets**.
-4. Add the secret:
+```bash
+pip install -r requirements.txt
+set GROQ_API_KEY=YOUR_KEY
+python app.py
+```
 
-`GROQ_API_KEY`
+On Linux/macOS:
 
-5. Let the Space rebuild.
-6. Open the Space app.
+```bash
+export GROQ_API_KEY=YOUR_KEY
+python app.py
+```
 
-Do **not** put the Groq API key in `app.py`, `README.md`, or GitHub.
+## Render deployment
 
-## Important
+Create a Render **Web Service** connected to this GitHub repository.
 
-The app uses session-based learner state for the prototype. It does not implement permanent user accounts or a production database.
+Build Command:
 
-The research stage intentionally separates web search from structured resource curation.
+```text
+pip install -r requirements.txt
+```
 
-## Demo suggestion
+Start Command:
 
-Use one consistent learner persona:
+```text
+python app.py
+```
 
-- 4 years automotive / EV engineering
-- strong PMSM, FOC, MATLAB, Simulink
-- developing Python / ML / Agentic AI skills
-- target role: AI-enabled EV Controls Engineer
+Plan:
 
-Then demonstrate:
+```text
+Free
+```
 
-1. Analyze Profile
-2. Generate Plan
-3. Generate Practice
-4. Submit Work
-5. Assess & Adapt
-6. Generate Updated Plan
-7. Research Priority Gap
-8. Generate Progress Report
-9. Ask EduPath
+Add the environment variable:
+
+```text
+GROQ_API_KEY
+```
+
+Do not commit the API key to GitHub.
+
+## Hugging Face
+
+Ordinary Gradio Spaces may require paid access depending on the account. This repository is intentionally deployment-neutral and works as a Python/Gradio web service on Render.
+
+## Security
+
+Keep `GROQ_API_KEY` only in the hosting provider's secret/environment-variable store.
+
+
+## Render port binding
+
+The app explicitly binds Gradio to `0.0.0.0` and the Render-provided `PORT`.
+SSR is disabled for the Render deployment to keep the server path simple.

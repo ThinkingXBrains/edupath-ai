@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: edupath-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false

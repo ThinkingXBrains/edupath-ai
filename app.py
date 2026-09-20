@@ -1430,8 +1430,6 @@ footer {
 
 with gr.Blocks(
     title="EduPath — Adaptive Learning Companion",
-    theme=gr.themes.Base(),
-    css=CUSTOM_CSS,
 ) as demo:
 
     ui_state = gr.State(None)
@@ -1752,4 +1750,18 @@ Ask why a topic appears in your path, what to focus on next, or how your recent 
 
 
 if __name__ == "__main__":
-    demo.launch()
+    # Render provides PORT at runtime. Render requires the web server
+    # to listen on 0.0.0.0:$PORT.
+    port = int(os.getenv("PORT", "10000"))
+
+    print(f"🚀 Starting EduPath on 0.0.0.0:{port}", flush=True)
+
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        show_error=True,
+        ssr_mode=False,
+        theme=gr.themes.Base(),
+        css=CUSTOM_CSS,
+    )
