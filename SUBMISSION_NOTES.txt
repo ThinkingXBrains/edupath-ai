@@ -1,17 +1,11 @@
-GitHub / Render submission notes
-
 Render:
 Build = pip install -r requirements.txt
 Start = python app.py
-
-Secret:
-GROQ_API_KEY
+Secret = GROQ_API_KEY
 
 Demo:
 Analyze → Plan → Practice → Submit → Assess & Adapt → Replan → Research → Progress → Ask
 
-Two-model routing:
-Qwen 3.8 27B = frequent learner operations
-GPT-OSS 120B = deep assessment only
-
-Do not publish the Groq API key.
+Two models:
+Qwen 3.8 27B = routine learner tasks
+GPT-OSS 120B = compact deep assessment

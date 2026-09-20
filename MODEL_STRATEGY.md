@@ -1,32 +1,40 @@
-# EduPath Model Routing
+# EduPath — Token-Safe Two-LLM Strategy
 
-## Current problem
+## The profile error
 
-On the hackathon/free account, Groq can enforce a very small rolling output-token budget. A large response can therefore fail even when the overall daily quota is not exhausted.
+The previous profile schema required the model to generate target_role,
+experience_years and weekly_hours even though the UI already had those values.
+The completion was truncated before the required fields.
 
-## Solution
+## Fix
 
-The app uses:
-- compact schemas
+Qwen now returns only:
+- up to 3 goals
+- up to 6 evidence-backed skills
+
+Python supplies:
+- target role
+- experience years
+- weekly hours
+
+and constructs the full LearnerProfile.
+
+## GPT-OSS 120B deep assessment
+
+Two compact stages:
+
+1. task + submission → compact AssessmentNotes
+2. AssessmentNotes only → final AssessmentResult
+
+Stage 2 never receives the original learner submission.
+
+## Token discipline
+
+- explicit output-token caps
 - compact prompts
-- explicit `max_output_tokens`
-- client-side rolling output reservations
-- two-stage 120B assessment
-- no LLM call for progress
-- no LLM call for web search
+- compact schemas
+- local rolling output-token reservation
+- research through DDGS
+- progress and mastery updates in Python
 
-## Routing
-
-Qwen 3.8 27B:
-profile, plan, practice, Q&A.
-
-GPT-OSS 120B:
-assessment notes + final assessment.
-
-Research:
-DDGS web search.
-
-Python:
-mastery update, gap calculation, progress report, session state.
-
-Splitting a prompt only helps when BOTH calls are individually and jointly small enough for the rolling output limit.
+This is token control, not a mechanism for bypassing Groq's provider limits.

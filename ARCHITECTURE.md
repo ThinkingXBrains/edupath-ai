@@ -1,35 +1,75 @@
 # EduPath Architecture
 
 ```text
-Learner
-  ↓
-Profile Agent — Qwen 3.8 27B
-  ↓
-Deterministic Skill Gap Engine
-  ↓
-Planner — Qwen 3.8 27B
-  ↓
-Practice — Qwen 3.8 27B
-  ↓
-Submission
-  ↓
-Deep Assessment Stage 1 — GPT-OSS 120B
-  ↓
-Compact notes
-  ↓
-Deep Assessment Stage 2 — GPT-OSS 120B
-  ↓
-Mastery update — Python
-  ↓
-Gap recalculation — Python
-  ↓
-Replan — Qwen 3.8 27B
-  ↓
-Research — DDGS
-  ↓
-Progress — Python
-  ↓
-Ask EduPath — Qwen 3.8 27B
+                       ┌───────────────────┐
+                       │      Learner      │
+                       └─────────┬─────────┘
+                                 │
+                                 ▼
+                      ┌─────────────────────┐
+                      │    Profile Agent    │
+                      │  Qwen 3.8 27B       │
+                      └─────────┬───────────┘
+                                │
+                                ▼
+                       Deterministic Gap Engine
+                                │
+                                ▼
+                      ┌─────────────────────┐
+                      │    Planner Agent    │
+                      │  Qwen 3.8 27B       │
+                      └─────────┬───────────┘
+                                │
+                                ▼
+                      ┌─────────────────────┐
+                      │   Practice Agent    │
+                      │  Qwen 3.8 27B       │
+                      └─────────┬───────────┘
+                                │
+                                ▼
+                         Learner Submission
+                                │
+                                ▼
+                      ┌─────────────────────┐
+                      │ Deep Assessment     │
+                      │ GPT-OSS 120B        │
+                      └─────────┬───────────┘
+                                │
+                       rate-limit fallback
+                                │
+                         ┌──────▼──────┐
+                         │ Qwen 27B    │
+                         └──────┬──────┘
+                                │
+                                ▼
+                        Deterministic Mastery
+                           + Gap Update
+                                │
+                                ▼
+                            Re-planner
+                                │
+                  ┌─────────────┼─────────────┐
+                  ▼             ▼             ▼
+             Web Search     Progress        Q&A
+               (DDGS)      Qwen 27B      Qwen 27B
+                  │
+                  ▼
+            Resource Curator
+              Qwen 27B
 ```
 
-The LLMs interpret evidence and generate learning content. Python owns numerical state transitions and mastery updates.
+### Why two models?
+
+Use the compact Qwen model for high-frequency, structured and conversational tasks.
+
+Reserve GPT-OSS 120B for the highest-value deep assessment stage, with a Qwen fallback.
+
+### What is deterministic?
+
+- skill-name normalization
+- target-role skill levels
+- gap calculation
+- mastery update
+- state management
+
+The LLMs do not directly decide the numerical mastery update rule.
